@@ -127,3 +127,72 @@ class SmallestFirstStrategy(BaseStrategy):
                 existing_stays.append(stay)
 
         return existing_stays
+
+
+class BestFitStrategy(BaseStrategy):
+    """Strategi: Placera båtar i platser som ger minst slösad bredd"""
+
+    def __init__(self):
+        super().__init__(
+            "best_fit",
+            "Placerar varje båt på den plats som ger minst outnyttjad bredd (minimerar spillyta)"
+        )
+
+    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+        # Sortera båtar efter ankomsttid
+        sorted_boats = sorted(boats, key=lambda b: b.arrival)
+        existing_stays = []
+
+        for boat in sorted_boats:
+            available_slots = self.find_available_slots(
+                boat, slots, existing_stays)
+
+            if available_slots:
+                # Välj den plats som ger minst slösad bredd
+                best_slot = self.find_best_slot(boat, available_slots,
+                                                lambda s: s.max_width - boat.width)
+
+                stay = BoatStay(
+                    boat_id=boat.id,
+                    slot_id=best_slot.id,
+                    start_time=boat.arrival,
+                    end_time=boat.departure,
+                    strategy_name=self.name
+                )
+                existing_stays.append(stay)
+
+        return existing_stays
+
+
+class EarliestArrivalFirstStrategy(BaseStrategy):
+    """Strategi: Placera båtar baserat på ankomsttid (tidigast först)"""
+
+    def __init__(self):
+        super().__init__(
+            "earliest_arrival",
+            "Prioriterar båtar med tidigast ankomsttid ('först till kvarn'-princip)"
+        )
+
+    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+        # Sortera båtar efter ankomsttid (tidigast först)
+        sorted_boats = sorted(boats, key=lambda b: b.arrival)
+        existing_stays = []
+
+        for boat in sorted_boats:
+            available_slots = self.find_available_slots(
+                boat, slots, existing_stays)
+
+            if available_slots:
+                # Välj den plats som ger minst slösad bredd
+                best_slot = self.find_best_slot(boat, available_slots)
+
+                stay = BoatStay(
+                    boat_id=boat.id,
+                    slot_id=best_slot.id,
+                    start_time=boat.arrival,
+                    end_time=boat.departure,
+                    strategy_name=self.name
+                )
+                existing_stays.append(stay)
+
+        return existing_stays
