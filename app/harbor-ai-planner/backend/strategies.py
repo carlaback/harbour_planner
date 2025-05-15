@@ -57,3 +57,39 @@ class BaseStrategy:
 
         # Standardkriterium: Minimera outnyttjad bredd
         return min(available_slots, key=lambda s: s.max_width - boat.width)
+
+
+class LargestFirstStrategy(BaseStrategy):
+    """Strategi: Placera de bredaste båtarna först"""
+
+    def __init__(self):
+        super().__init__(
+            "largest_first",
+            "Prioriterar de bredaste båtarna först för att säkerställa att stora båtar får plats"
+        )
+
+    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+        # Sortera båtar efter bredd (störst först)
+        sorted_boats = sorted(boats, key=lambda b: b.width, reverse=True)
+        existing_stays = []
+
+        for boat in sorted_boats:
+            # Hitta tillgängliga platser
+            available_slots = self.find_available_slots(
+                boat, slots, existing_stays)
+
+            if available_slots:
+                # Hitta bästa plats
+                best_slot = self.find_best_slot(boat, available_slots)
+
+                # Skapa en ny vistelse
+                stay = BoatStay(
+                    boat_id=boat.id,
+                    slot_id=best_slot.id,
+                    start_time=boat.arrival,
+                    end_time=boat.departure,
+                    strategy_name=self.name
+                )
+                existing_stays.append(stay)
+
+        return existing_stays
