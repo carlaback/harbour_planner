@@ -276,3 +276,22 @@ class RandomStrategy(BaseStrategy):
                 existing_stays.append(stay)
 
         return existing_stays
+
+
+# Skapa en lista över alla tillgängliga strategier
+ALL_STRATEGIES = [
+    LargestFirstStrategy(),
+    SmallestFirstStrategy(),
+    BestFitStrategy(),
+    EarliestArrivalFirstStrategy(),
+    TemporaryFirstStrategy(),
+    RandomStrategy(),
+]
+
+# Dictionary för enkel åtkomst av strategier via namn
+STRATEGY_MAP = {strategy.name: strategy for strategy in ALL_STRATEGIES}
+
+
+def get_strategy_by_name(name: str) -> BaseStrategy:
+    """Hämta en strategi baserat på dess namn"""
+    return STRATEGY_MAP.get(name)
