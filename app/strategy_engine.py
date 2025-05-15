@@ -8,3 +8,9 @@ class Boat:
         self.width = width
         self.arrival = arrival
         self.departure = departure
+
+
+class Slot:
+    def __init__(self, id: str, max_width: float):
+        self.id = id
+        self.max_width = max_width
