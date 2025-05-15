@@ -93,3 +93,23 @@ class LargestFirstStrategy(BaseStrategy):
                 existing_stays.append(stay)
 
         return existing_stays
+
+
+class SmallestFirstStrategy(BaseStrategy):
+    """Strategi: Placera de smalaste båtarna först"""
+
+    def __init__(self):
+        super().__init__(
+            "smallest_first",
+            "Prioriterar de smalaste båtarna först för att säkerställa att små båtar får plats"
+        )
+
+    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+        # Sortera båtar efter bredd (störst först)
+        sorted_boats = sorted(boats, key=lambda b: b.width, reverse=True)
+        existing_stays = []
+
+        for boat in sorted_boats:
+            # Hitta alla tillgängliga platser för denna båt
+            available_slots = self.find_available_slots(
+                boat, slots, existing_stays)
