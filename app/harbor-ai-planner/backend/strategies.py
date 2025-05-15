@@ -196,3 +196,83 @@ class EarliestArrivalFirstStrategy(BaseStrategy):
                 existing_stays.append(stay)
 
         return existing_stays
+
+
+class TemporaryFirstStrategy(BaseStrategy):
+    """Strategi: Prioritera temporärt tillgängliga platser först"""
+
+    def __init__(self):
+        super().__init__(
+            "temporary_first",
+            "Prioriterar att fylla temporärt tillgängliga platser först för att maximera nyttjandet av dessa"
+        )
+
+    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+        # Sortera båtar efter ankomsttid
+        sorted_boats = sorted(boats, key=lambda b: b.arrival)
+        existing_stays = []
+
+        for boat in sorted_boats:
+            available_slots = self.find_available_slots(
+                boat, slots, existing_stays)
+
+            if available_slots:
+                # Dela upp i temporära och vanliga platser
+                temp_slots = [
+                    s for s in available_slots if s.is_reserved and s.available_from and s.available_until]
+                regular_slots = [
+                    s for s in available_slots if not s.is_reserved]
+
+                if temp_slots:
+                    # Prioritera temporära platser
+                    best_slot = self.find_best_slot(boat, temp_slots)
+                elif regular_slots:
+                    # Om inga temporära, använd vanliga platser
+                    best_slot = self.find_best_slot(boat, regular_slots)
+                else:
+                    continue  # Ingen lämplig plats
+
+                stay = BoatStay(
+                    boat_id=boat.id,
+                    slot_id=best_slot.id,
+                    start_time=boat.arrival,
+                    end_time=boat.departure,
+                    strategy_name=self.name
+                )
+                existing_stays.append(stay)
+
+        return existing_stays
+
+
+class RandomStrategy(BaseStrategy):
+    """Strategi: Placera båtar slumpmässigt"""
+
+    def __init__(self):
+        super().__init__(
+            "random",
+            "Placerar båtar i slumpmässig ordning (baslinje för jämförelse)"
+        )
+
+    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+        # Slumpa ordningen på båtarna
+        shuffled_boats = random.sample(boats, len(boats))
+        existing_stays = []
+
+        for boat in shuffled_boats:
+            available_slots = self.find_available_slots(
+                boat, slots, existing_stays)
+
+            if available_slots:
+                # Välj en slumpmässig plats bland de tillgängliga
+                chosen_slot = random.choice(available_slots)
+
+                stay = BoatStay(
+                    boat_id=boat.id,
+                    slot_id=chosen_slot.id,
+                    start_time=boat.arrival,
+                    end_time=boat.departure,
+                    strategy_name=self.name
+                )
+                existing_stays.append(stay)
+
+        return existing_stays
