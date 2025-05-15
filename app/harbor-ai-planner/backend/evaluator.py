@@ -89,3 +89,108 @@ class StrategyEvaluator:
             "available_temporary_slots_total": available_temporary_slots_total,
             "score": score
         }
+
+
+@staticmethod
+def evaluate_all_strategies(db: Session, all_strategies_results: Dict[str, List[BoatStay]],
+                            all_boats: List[Boat], all_slots: List[Slot]) -> Dict[str, Dict[str, Any]]:
+    """Utvärdera alla strategier och returnera en jämförelse"""
+
+    results = {}
+
+    for strategy_name, boat_stays in all_strategies_results.items():
+        results[strategy_name] = StrategyEvaluator.evaluate_strategy(
+            db, boat_stays, all_boats, all_slots)
+
+    # Lägg till vilket strategi som är bäst enligt vårt score
+    best_strategy = max(
+        results.items(), key=lambda x: x[1]["score"], default=(None, None))
+    if best_strategy[0]:
+        for strategy_name, eval_results in results.items():
+            eval_results["is_best_by_score"] = (
+                strategy_name == best_strategy[0])
+
+    return results
+
+    @staticmethod
+    def get_detailed_evaluation(db: Session, all_strategies_results: Dict[str, List[BoatStay]],
+                                all_boats: List[Boat], all_slots: List[Slot]) -> Dict[str, Any]:
+        """Gör en djupare utvärdering som inkluderar olika mätvärden och jämförelser"""
+
+        # Grundläggande utvärdering av alla strategier
+        basic_eval = StrategyEvaluator.evaluate_all_strategies(
+            db, all_strategies_results, all_boats, all_slots)
+
+        # Identifiera de bästa strategierna enligt olika mått
+        best_by_placed_boats = max(basic_eval.items(
+        ), key=lambda x: x[1]["placed_boats_count"], default=(None, None))
+        best_by_efficiency = max(
+            basic_eval.items(), key=lambda x: x[1]["efficiency"], default=(None, None))
+        best_by_temp_slots = max(basic_eval.items(
+        ), key=lambda x: x[1]["available_temporary_slots_used"], default=(None, None))
+        best_by_score = max(basic_eval.items(),
+                            key=lambda x: x[1]["score"], default=(None, None))
+
+        # Skapa en detaljerad sammanfattning
+        detailed_summary = {
+            "total_boats": len(all_boats),
+            "total_slots": len(all_slots),
+            "temporary_slots": sum(1 for s in all_slots if s.is_reserved and s.available_from and s.available_until),
+            "permanent_slots": sum(1 for s in all_slots if s.is_reserved and (not s.available_from or not s.available_until)),
+            "regular_slots": sum(1 for s in all_slots if not s.is_reserved),
+            "best_strategy": {
+                "by_placed_boats": best_by_placed_boats[0],
+                "by_efficiency": best_by_efficiency[0],
+                "by_temp_slots": best_by_temp_slots[0],
+                "by_score": best_by_score[0]
+            },
+            "strategy_evaluations": basic_eval
+        }
+
+        # Analysera breddfördelning - viktigt för att förstå hur bra matchning av bredder
+        boat_width_distribution = {}
+        for boat in all_boats:
+            width_category = round(boat.width * 2) / \
+                2  # Avrunda till närmaste 0.5
+            if width_category not in boat_width_distribution:
+                boat_width_distribution[width_category] = 0
+            boat_width_distribution[width_category] += 1
+
+        slot_width_distribution = {}
+        for slot in all_slots:
+            width_category = round(slot.max_width * 2) / \
+                2  # Avrunda till närmaste 0.5
+            if width_category not in slot_width_distribution:
+                slot_width_distribution[width_category] = 0
+            slot_width_distribution[width_category] += 1
+
+        detailed_summary["width_distribution"] = {
+            "boats": {str(k): v for k, v in sorted(boat_width_distribution.items())},
+            "slots": {str(k): v for k, v in sorted(slot_width_distribution.items())}
+        }
+
+        # Analys av vilka typer av båtar som inte fick plats
+        unplaced_analysis = {}
+        for strategy_name, boat_stays in all_strategies_results.items():
+            placed_boat_ids = {stay.boat_id for stay in boat_stays}
+            unplaced_boats = [
+                b for b in all_boats if b.id not in placed_boat_ids]
+
+            # Gruppera oplacerade båtar efter bredd
+            unplaced_by_width = {}
+            for boat in unplaced_boats:
+                # Avrunda till närmaste 0.5
+                width_category = round(boat.width * 2) / 2
+                if width_category not in unplaced_by_width:
+                    unplaced_by_width[width_category] = 0
+                unplaced_by_width[width_category] += 1
+
+            unplaced_analysis[strategy_name] = {
+                "total_unplaced": len(unplaced_boats),
+                "unplaced_by_width": {str(k): v for k, v in sorted(unplaced_by_width.items())},
+                "average_width": sum(b.width for b in unplaced_boats) / len(unplaced_boats) if unplaced_boats else 0
+            }
+
+        detailed_summary["unplaced_analysis"] = unplaced_analysis
+
+        return detailed_summary
