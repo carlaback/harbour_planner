@@ -140,7 +140,7 @@ class BoatStay(Base):
         """
         # Överlappning sker om en vistelse börjar innan den andra slutar
         # och slutar efter att den andra börjar
-        return (max(self.start_time, other_stay.start_time)
+        return (max(self.start_time, other_stay.start_time) <
                 min(self.end_time, other_stay.end_time))
 
     def duration_days(self):

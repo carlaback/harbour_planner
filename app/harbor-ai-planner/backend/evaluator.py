@@ -45,7 +45,7 @@ class StrategyEvaluator:
             if slot and slot.is_reserved and slot.available_from and slot.available_until:
                 used_temporary_slots += 1
 
-                # Beräkna outnyttjad bredd
+        # Beräkna outnyttjad bredd
         total_unused_width = 0
         for stay in boat_stays:
             boat = next((b for b in all_boats if b.id == stay.boat_id), None)
@@ -53,6 +53,10 @@ class StrategyEvaluator:
             if boat and slot:
                 unused_width = slot.max_width - boat.width
                 total_unused_width += unused_width
+
+        # Beräkna genomsnittlig outnyttjad bredd per plats
+        average_unused_width_per_slot = total_unused_width / \
+            used_slots_count if used_slots_count > 0 else 0
 
         # Beräkna effektivitet
         efficiency = (placed_boats_count / len(all_boats)) * \
