@@ -1,21 +1,131 @@
+# gpt_analyzer.py - uppdaterad version
 from typing import Dict, Any, List
 from datetime import datetime
-import openai
 import json
 import os
+from openai import OpenAI
 from models import Boat, Slot
+from config import Settings
 
 
 class GPTAnalyzer:
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("OpenAI API key is required")
-        openai.api_key = self.api_key
+    """Analyserar strategier och ger rekommendationer med hjälp av GPT"""
 
-    def analyze_strategies(self, strategy_evaluations: Dict[str, Dict[str, Any]],
-                           boats: List[Boat], slots: List[Slot]) -> Dict[str, Any]:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        # Använd settings.OPENAI_API_KEY (notera versaler)
+        self.api_key = settings.OPENAI_API_KEY if hasattr(
+            settings, 'OPENAI_API_KEY') else settings.openai_api_key
+        self.client = None
+
+        if self.api_key:
+            self.client = OpenAI(api_key=self.api_key)
+
+    async def analyze_strategies(self, evaluation_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Analysera resultaten från olika strategier och ge rekommendationer"""
+        if not self.api_key or not self.client:
+            return {
+                "error": "OpenAI API key not configured",
+                "recommendation": "Please configure OpenAI API key in settings"
+            }
+
+        try:
+            # Skapa en sammanfattning av resultaten
+            summary = self._create_summary(evaluation_results)
+
+            # Generera prompt för GPT
+            prompt = self._create_prompt(summary)
+
+            # Anropa GPT API med det nya OpenAI API:et
+            response = self.client.chat.completions.create(
+                model="gpt-3.5-turbo",  # Använd en säkrare modell
+                messages=[
+                    {"role": "system", "content": "You are an expert in harbor management and boat placement optimization."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=1000
+            )
+
+            # Extrahera och formatera svaret
+            analysis = response.choices[0].message.content
+
+            return {
+                "analysis": analysis,
+                "summary": summary,
+                "recommendation": self._extract_recommendation(analysis)
+            }
+
+        except Exception as e:
+            return {
+                "error": f"Error communicating with OpenAI: {str(e)}",
+                "recommendation": "Failed to analyze strategies"
+            }
+
+    def _create_summary(self, evaluation_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Skapa en sammanfattning av utvärderingsresultaten"""
+        summary = {
+            "total_strategies": len(evaluation_results),
+            "strategies": []
+        }
+
+        for result in evaluation_results:
+            strategy_summary = {
+                "name": result["strategy_name"],
+                "description": result["strategy_description"],
+                "metrics": result["metrics"]
+            }
+            summary["strategies"].append(strategy_summary)
+
+        return summary
+
+    def _create_prompt(self, summary: Dict[str, Any]) -> str:
+        """Skapa en prompt för GPT baserad på sammanfattningen"""
+        prompt = f"""Analyze the following harbor placement strategy results and provide recommendations:
+
+Total strategies evaluated: {summary['total_strategies']}
+
+Strategy Results:
+"""
+
+        for strategy in summary["strategies"]:
+            metrics = strategy["metrics"]
+            prompt += f"""
+Strategy: {strategy['name']}
+Description: {strategy['description']}
+- Boats placed: {metrics['boats_placed']}
+- Placement rate: {metrics['placement_rate']:.2%}
+- Average width utilization: {metrics['average_width_utilization']:.2%}
+- Total width utilization: {metrics['total_width_utilization']:.2%}
+"""
+
+        prompt += """
+Please provide:
+1. A detailed analysis of the results
+2. Which strategy performed best and why
+3. Specific recommendations for improving the harbor layout
+4. Suggestions for future strategy development
+"""
+
+        return prompt
+
+    def _extract_recommendation(self, analysis: str) -> str:
+        """Extrahera den viktigaste rekommendationen från analysen"""
+        # Försök hitta den första rekommendationen i texten
+        lines = analysis.split('\n')
+        for line in lines:
+            if line.strip().startswith(('Recommendation:', 'Suggestion:', 'Best strategy:')):
+                return line.strip()
+        return lines[0] if lines else "No specific recommendation found"
+
+    def analyze_strategies_old(self, strategy_evaluations: Dict[str, Dict[str, Any]],
+                               boats: List[Boat], slots: List[Slot]) -> Dict[str, Any]:
         """Analyserar strategier och ger rekommendationer"""
+        if not self.client:
+            return {
+                "error": "OpenAI API key not configured",
+                "recommendation": "Please configure OpenAI API key in settings"
+            }
 
         # Samla grundläggande data
         analysis_data = {
@@ -36,13 +146,13 @@ class GPTAnalyzer:
         return {
             "total": len(boats),
             "widths": {
-                "min": min(b.width for b in boats),
-                "max": max(b.width for b in boats),
-                "avg": sum(b.width for b in boats) / len(boats)
+                "min": min(b.width for b in boats) if boats else 0,
+                "max": max(b.width for b in boats) if boats else 0,
+                "avg": sum(b.width for b in boats) / len(boats) if boats else 0
             },
             "time_range": {
-                "earliest": min(b.arrival for b in boats),
-                "latest": max(b.departure for b in boats)
+                "earliest": min(b.arrival for b in boats) if boats else None,
+                "latest": max(b.departure for b in boats) if boats else None
             }
         }
 
@@ -51,22 +161,25 @@ class GPTAnalyzer:
         return {
             "total": len(slots),
             "widths": {
-                "min": min(s.max_width for s in slots),
-                "max": max(s.max_width for s in slots),
-                "avg": sum(s.max_width for s in slots) / len(slots)
+                "min": min(s.max_width for s in slots) if slots else 0,
+                "max": max(s.max_width for s in slots) if slots else 0,
+                "avg": sum(s.max_width for s in slots) / len(slots) if slots else 0
             }
         }
 
     def _find_bottlenecks(self, boats: List[Boat], slots: List[Slot]) -> Dict[str, Any]:
         """Identifierar potentiella flaskhalsar"""
         return {
-            "width_mismatch": max(b.width for b in boats) > max(s.max_width for s in slots),
+            "width_mismatch": max(b.width for b in boats) > max(s.max_width for s in slots) if boats and slots else False,
             "capacity_issue": len(boats) > len(slots),
             "time_conflict": self._check_time_conflicts(boats)
         }
 
     def _check_time_conflicts(self, boats: List[Boat]) -> bool:
         """Kontrollerar om det finns tidskonflikter"""
+        if not boats or len(boats) < 2:
+            return False
+
         time_slots = [(b.arrival, b.departure) for b in boats]
         time_slots.sort(key=lambda x: x[0])
 
@@ -108,11 +221,12 @@ class GPTAnalyzer:
     def _get_gpt_response(self, prompt: str) -> str:
         """Hämtar svar från GPT"""
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-4",
+            # Använd det nya API:et för att anropa OpenAI
+            response = self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=3000
+                temperature=0.7,
+                max_tokens=1000
             )
             return response.choices[0].message.content
         except Exception as e:

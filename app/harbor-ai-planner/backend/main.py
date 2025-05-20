@@ -4,10 +4,9 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select, update, delete
+from sqlalchemy.orm import selectinload
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import json
@@ -17,6 +16,8 @@ import random
 import traceback
 import os
 from contextlib import asynccontextmanager
+from pydantic import BaseModel
+import asyncio
 
 # ----------------
 # Importera projektspecifika moduler
@@ -40,16 +41,28 @@ logger = logging.getLogger(__name__)
 # ----------------
 # Skapa databaskoppling
 # ----------------
-# Skapa SQLAlchemy engine med konfigurerade anslutningsparametrar
-engine = create_engine(
-    settings.DATABASE_URL,
+# Skapa async SQLAlchemy engine med asyncpg
+# Ändra URL från postgresql:// till postgresql+asyncpg://
+database_url = settings.DATABASE_URL
+if database_url.startswith("postgresql://"):
+    database_url = database_url.replace(
+        "postgresql://", "postgresql+asyncpg://", 1)
+
+engine = create_async_engine(
+    database_url,
     pool_size=settings.DB_POOL_SIZE,
     max_overflow=settings.DB_MAX_OVERFLOW,
-    pool_recycle=settings.DB_POOL_RECYCLE
+    pool_recycle=settings.DB_POOL_RECYCLE,
+    echo=settings.DEBUG,
+    future=True
 )
 
-# Skapa en sessionfabrik för att hantera databassessioner
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Skapa en async sessionfabrik
+async_session = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False
+)
 
 # ----------------
 # Hantera applikationens livscykel
@@ -67,20 +80,18 @@ async def lifespan(app: FastAPI):
 
     # Skapa tabeller i databasen om de inte finns
     try:
-        Base.metadata.create_all(bind=engine)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
         logger.info("Database tables created or verified")
     except Exception as e:
         logger.error(f"Failed to create database tables: {str(e)}")
         # Fortsätt ändå - tabellerna kanske redan finns
 
-    # Initiera eventuella resurser, anslutningar eller cacher här
-
     yield  # Här körs applikationen
 
     # Kod som körs vid applikationsavstängning
     logger.info(f"Shutting down {settings.APP_NAME}")
-
-    # Stäng eventuella öppna anslutningar eller resurser här
+    await engine.dispose()
 
 # ----------------
 # Skapa FastAPI-applikation
@@ -109,16 +120,16 @@ app.add_middleware(
 # ----------------
 
 
-def get_db():
+async def get_db():
     """
     Dependency-funktion för att få en databassession.
     Säkerställer att sessioner stängs korrekt även vid fel.
     """
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    async with async_session() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
 
 # ----------------
 # Hjälpfunktioner
@@ -171,14 +182,14 @@ async def root():
 
 
 @app.get("/health", tags=["General"])
-async def health_check(db: Session = Depends(get_db)):
+async def health_check(db: AsyncSession = Depends(get_db)):
     """
     Hälsokontroll för att verifiera att applikationen fungerar korrekt.
     Kontrollerar databaskoppling och andra kritiska komponenter.
     """
     try:
         # Kontrollera databaskoppling med en enkel förfrågan
-        db.execute("SELECT 1").first()
+        await db.execute(select(1))
 
         # Kontrollera GPT API-nyckel
         if not settings.OPENAI_API_KEY:
@@ -233,7 +244,7 @@ async def get_strategies():
 async def get_boats(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Hämta alla båtar med paginering.
@@ -243,7 +254,8 @@ async def get_boats(
         limit: Maximalt antal båtar att returnera
     """
     try:
-        boats = db.query(Boat).offset(skip).limit(limit).all()
+        boats = await db.execute(select(Boat).offset(skip).limit(limit))
+        boats = boats.scalars().all()
         return [
             {
                 "id": boat.id,
@@ -260,7 +272,7 @@ async def get_boats(
 
 
 @app.get("/api/boats/{boat_id}", response_model=Dict[str, Any], tags=["Boats"])
-async def get_boat(boat_id: int, db: Session = Depends(get_db)):
+async def get_boat(boat_id: int, db: AsyncSession = Depends(get_db)):
     """
     Hämta en specifik båt baserat på ID.
 
@@ -268,7 +280,7 @@ async def get_boat(boat_id: int, db: Session = Depends(get_db)):
         boat_id: ID för båten att hämta
     """
     try:
-        boat = db.query(Boat).filter(Boat.id == boat_id).first()
+        boat = await db.get(Boat, boat_id)
         if not boat:
             raise HTTPException(
                 status_code=404, detail=f"Boat with ID {boat_id} not found")
@@ -290,7 +302,7 @@ async def get_boat(boat_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/boats", response_model=Dict[str, Any], tags=["Boats"])
-async def create_boat(boat_data: Dict[str, Any], db: Session = Depends(get_db)):
+async def create_boat(boat_data: Dict[str, Any], db: AsyncSession = Depends(get_db)):
     """
     Skapa en ny båt.
 
@@ -338,8 +350,8 @@ async def create_boat(boat_data: Dict[str, Any], db: Session = Depends(get_db)):
         )
 
         db.add(boat)
-        db.commit()
-        db.refresh(boat)
+        await db.commit()
+        await db.refresh(boat)
 
         logger.info(f"Created new boat: {boat.name} (ID: {boat.id})")
 
@@ -354,14 +366,14 @@ async def create_boat(boat_data: Dict[str, Any], db: Session = Depends(get_db)):
         # Vidarebefordra HTTP-undantag
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to create boat: {error}")
 
 
 @app.put("/api/boats/{boat_id}", response_model=Dict[str, Any], tags=["Boats"])
-async def update_boat(boat_id: int, boat_data: Dict[str, Any], db: Session = Depends(get_db)):
+async def update_boat(boat_id: int, boat_data: Dict[str, Any], db: AsyncSession = Depends(get_db)):
     """
     Uppdatera en befintlig båt.
 
@@ -371,7 +383,7 @@ async def update_boat(boat_id: int, boat_data: Dict[str, Any], db: Session = Dep
     """
     try:
         # Hämta båten
-        boat = db.query(Boat).filter(Boat.id == boat_id).first()
+        boat = await db.get(Boat, boat_id)
         if not boat:
             raise HTTPException(
                 status_code=404, detail=f"Boat with ID {boat_id} not found")
@@ -408,8 +420,8 @@ async def update_boat(boat_id: int, boat_data: Dict[str, Any], db: Session = Dep
             )
 
         # Spara ändringarna
-        db.commit()
-        db.refresh(boat)
+        await db.commit()
+        await db.refresh(boat)
 
         logger.info(f"Updated boat: {boat.name} (ID: {boat.id})")
 
@@ -424,14 +436,14 @@ async def update_boat(boat_id: int, boat_data: Dict[str, Any], db: Session = Dep
         # Vidarebefordra HTTP-undantag
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to update boat: {error}")
 
 
 @app.delete("/api/boats/{boat_id}", response_model=Dict[str, Any], tags=["Boats"])
-async def delete_boat(boat_id: int, db: Session = Depends(get_db)):
+async def delete_boat(boat_id: int, db: AsyncSession = Depends(get_db)):
     """
     Ta bort en båt.
 
@@ -440,13 +452,13 @@ async def delete_boat(boat_id: int, db: Session = Depends(get_db)):
     """
     try:
         # Hämta båten
-        boat = db.query(Boat).filter(Boat.id == boat_id).first()
+        boat = await db.get(Boat, boat_id)
         if not boat:
             raise HTTPException(status_code=404, detail="Boat not found")
 
         # Ta bort båten
-        db.delete(boat)
-        db.commit()
+        await db.delete(boat)
+        await db.commit()
 
         logger.info(f"Deleted boat: {boat.name} (ID: {boat.id})")
 
@@ -455,7 +467,7 @@ async def delete_boat(boat_id: int, db: Session = Depends(get_db)):
         # Vidarebefordra HTTP-undantag
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to delete boat: {error}")
@@ -467,7 +479,7 @@ async def delete_boat(boat_id: int, db: Session = Depends(get_db)):
 async def get_slots(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Hämta alla båtplatser med paginering.
@@ -477,7 +489,8 @@ async def get_slots(
         limit: Maximalt antal platser att returnera
     """
     try:
-        slots = db.query(Slot).offset(skip).limit(limit).all()
+        slots = await db.execute(select(Slot).offset(skip).limit(limit))
+        slots = slots.scalars().all()
         return [
             {
                 "id": slot.id,
@@ -496,7 +509,7 @@ async def get_slots(
 
 
 @app.get("/api/slots/{slot_id}", response_model=Dict[str, Any], tags=["Slots"])
-async def get_slot(slot_id: int, db: Session = Depends(get_db)):
+async def get_slot(slot_id: int, db: AsyncSession = Depends(get_db)):
     """
     Hämta en specifik båtplats baserat på ID.
 
@@ -504,7 +517,7 @@ async def get_slot(slot_id: int, db: Session = Depends(get_db)):
         slot_id: ID för platsen att hämta
     """
     try:
-        slot = db.query(Slot).filter(Slot.id == slot_id).first()
+        slot = await db.get(Slot, slot_id)
         if not slot:
             raise HTTPException(
                 status_code=404, detail=f"Slot with ID {slot_id} not found")
@@ -528,7 +541,7 @@ async def get_slot(slot_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/slots", response_model=Dict[str, Any], tags=["Slots"])
-async def create_slot(slot_data: Dict[str, Any], db: Session = Depends(get_db)):
+async def create_slot(slot_data: Dict[str, Any], db: AsyncSession = Depends(get_db)):
     """
     Skapa en ny båtplats.
 
@@ -586,8 +599,8 @@ async def create_slot(slot_data: Dict[str, Any], db: Session = Depends(get_db)):
         )
 
         db.add(slot)
-        db.commit()
-        db.refresh(slot)
+        await db.commit()
+        await db.refresh(slot)
 
         logger.info(f"Created new slot: {slot.name} (ID: {slot.id})")
 
@@ -604,14 +617,14 @@ async def create_slot(slot_data: Dict[str, Any], db: Session = Depends(get_db)):
         # Vidarebefordra HTTP-undantag
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to create slot: {error}")
 
 
 @app.put("/api/slots/{slot_id}", response_model=Dict[str, Any], tags=["Slots"])
-async def update_slot(slot_id: int, slot_data: Dict[str, Any], db: Session = Depends(get_db)):
+async def update_slot(slot_id: int, slot_data: Dict[str, Any], db: AsyncSession = Depends(get_db)):
     """
     Uppdatera en befintlig båtplats.
 
@@ -621,7 +634,7 @@ async def update_slot(slot_id: int, slot_data: Dict[str, Any], db: Session = Dep
     """
     try:
         # Hämta platsen
-        slot = db.query(Slot).filter(Slot.id == slot_id).first()
+        slot = await db.get(Slot, slot_id)
         if not slot:
             raise HTTPException(
                 status_code=404, detail=f"Slot with ID {slot_id} not found")
@@ -669,8 +682,8 @@ async def update_slot(slot_id: int, slot_data: Dict[str, Any], db: Session = Dep
             )
 
         # Spara ändringarna
-        db.commit()
-        db.refresh(slot)
+        await db.commit()
+        await db.refresh(slot)
 
         logger.info(f"Updated slot: {slot.name} (ID: {slot.id})")
 
@@ -687,14 +700,14 @@ async def update_slot(slot_id: int, slot_data: Dict[str, Any], db: Session = Dep
         # Vidarebefordra HTTP-undantag
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to update slot: {error}")
 
 
 @app.delete("/api/slots/{slot_id}", response_model=Dict[str, Any], tags=["Slots"])
-async def delete_slot(slot_id: int, db: Session = Depends(get_db)):
+async def delete_slot(slot_id: int, db: AsyncSession = Depends(get_db)):
     """
     Ta bort en båtplats.
 
@@ -703,13 +716,13 @@ async def delete_slot(slot_id: int, db: Session = Depends(get_db)):
     """
     try:
         # Hämta platsen
-        slot = db.query(Slot).filter(Slot.id == slot_id).first()
+        slot = await db.get(Slot, slot_id)
         if not slot:
             raise HTTPException(status_code=404, detail="Slot not found")
 
         # Ta bort platsen
-        db.delete(slot)
-        db.commit()
+        await db.delete(slot)
+        await db.commit()
 
         logger.info(f"Deleted slot: {slot.name} (ID: {slot.id})")
 
@@ -718,7 +731,7 @@ async def delete_slot(slot_id: int, db: Session = Depends(get_db)):
         # Vidarebefordra HTTP-undantag
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to delete slot: {error}")
@@ -731,7 +744,7 @@ async def optimize_harbor(
     background_tasks: BackgroundTasks,
     strategy_names: List[str] = Query(None),
     run_in_background: bool = Query(False),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Kör optimering med valda strategier och utför AI-analys.
@@ -750,20 +763,17 @@ async def optimize_harbor(
     async def run_optimization():
         try:
             # Använd en ny databassession för bakgrundsuppgiften
-            async_db = SessionLocal()
+            async with async_session() as async_db:
+                try:
+                    result = await _perform_optimization(async_db, strategy_names)
 
-            try:
-                result = await _perform_optimization(async_db, strategy_names)
+                    # Spara resultatet för senare hämtning
+                    with open(f"{job_id}.json", "w") as f:
+                        json.dump(result, f, default=str)
 
-                # Spara resultatet för senare hämtning
-                # I en verklig implementation skulle detta sparas i en databas eller cache
-                # För enkelhetens skull sparar vi bara i filsystemet här
-                with open(f"{job_id}.json", "w") as f:
-                    json.dump(result, f, default=str)
-
-                logger.info(f"Background optimization completed: {job_id}")
-            finally:
-                async_db.close()
+                    logger.info(f"Background optimization completed: {job_id}")
+                finally:
+                    await async_db.close()
         except Exception as e:
             logger.error(f"Background optimization failed: {str(e)}")
             # Spara fel för senare hämtning
@@ -783,7 +793,7 @@ async def optimize_harbor(
     return await _perform_optimization(db, strategy_names)
 
 
-async def _perform_optimization(db: Session, strategy_names: List[str] = None) -> Dict[str, Any]:
+async def _perform_optimization(db: AsyncSession, strategy_names: List[str] = None) -> Dict[str, Any]:
     """
     Utför den faktiska optimeringsprocessen.
 
@@ -799,8 +809,14 @@ async def _perform_optimization(db: Session, strategy_names: List[str] = None) -
         logger.info("Starting optimization process")
 
         # Hämta alla båtar och platser från databasen
-        boats = db.query(Boat).all()
-        slots = db.query(Slot).all()
+        boats_query = select(Boat).options(selectinload(Boat.boat_stays))
+        slots_query = select(Slot).options(selectinload(Slot.boat_stays))
+
+        boats_result = await db.execute(boats_query)
+        slots_result = await db.execute(slots_query)
+
+        boats = boats_result.scalars().all()
+        slots = slots_result.scalars().all()
 
         if not boats:
             raise HTTPException(status_code=400, detail="No boats in database")
@@ -835,7 +851,7 @@ async def _perform_optimization(db: Session, strategy_names: List[str] = None) -
             logger.info(f"Running strategy: {strategy.name}")
 
             # Implementera timeout-skydd
-            boat_stays = strategy.place_boats(db, boats, slots)
+            boat_stays = await strategy.place_boats(db, boats, slots)
 
             all_results[strategy.name] = boat_stays
 
@@ -845,11 +861,11 @@ async def _perform_optimization(db: Session, strategy_names: List[str] = None) -
 
         # Utvärdera resultaten från alla strategier
         logger.info("Evaluating strategy results")
-        evaluations = StrategyEvaluator.evaluate_all_strategies(
+        evaluations = await StrategyEvaluator.evaluate_all_strategies(
             db, all_results, boats, slots)
 
         # Skapa en detaljerad utvärdering med mer information
-        detailed_evaluation = StrategyEvaluator.get_detailed_evaluation(
+        detailed_evaluation = await StrategyEvaluator.get_detailed_evaluation(
             db, all_results, boats, slots)
 
         # Använd GPT för att analysera resultaten om API-nyckel finns
@@ -857,7 +873,7 @@ async def _perform_optimization(db: Session, strategy_names: List[str] = None) -
             logger.info("Starting GPT analysis")
             try:
                 gpt_analyzer = GPTAnalyzer(api_key=settings.OPENAI_API_KEY)
-                gpt_analysis = gpt_analyzer.analyze_strategies(
+                gpt_analysis = await gpt_analyzer.analyze_strategies(
                     evaluations, boats, slots
                 )
                 logger.info("GPT analysis completed successfully")
@@ -960,7 +976,7 @@ async def create_test_data(
     slots_count: int = Query(settings.TEST_SLOTS_COUNT, ge=1, le=1000),
     temp_slots_percent: float = Query(
         settings.TEST_TEMP_SLOTS_PERCENT, ge=0, le=100),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Skapa testdata med båtar och platser.
@@ -975,9 +991,9 @@ async def create_test_data(
             f"Creating test data: {boats_count} boats, {slots_count} slots, {temp_slots_percent}% temp slots")
 
         # Rensa befintliga data
-        db.query(BoatStay).delete()
-        db.query(Boat).delete()
-        db.query(Slot).delete()
+        await db.execute(delete(BoatStay))
+        await db.execute(delete(Boat))
+        await db.execute(delete(Slot))
 
         # Beräkna antal platser av varje typ
         regular_slots_count = int(
@@ -1056,9 +1072,9 @@ async def create_test_data(
             )
 
         # Spara till databasen
-        db.add_all(slots)
-        db.add_all(boats)
-        db.commit()
+        await db.add_all(slots)
+        await db.add_all(boats)
+        await db.commit()
 
         logger.info(
             f"Test data created successfully: {len(slots)} slots, {len(boats)} boats")
@@ -1075,7 +1091,7 @@ async def create_test_data(
         }
 
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to create test data: {error}")
@@ -1088,7 +1104,7 @@ async def get_stays(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
     strategy: str = Query(None),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Hämta alla båtvistelser med paginering och filtrering.
@@ -1100,23 +1116,28 @@ async def get_stays(
     """
     try:
         # Skapa en basförfrågan
-        query = db.query(BoatStay)
+        query = select(BoatStay)
 
         # Lägg till filter om strategi anges
         if strategy:
             query = query.filter(BoatStay.strategy_name == strategy)
 
         # Hämta vistelser med paginering
-        stays = query.offset(skip).limit(limit).all()
+        result = await db.execute(query.offset(skip).limit(limit))
+        stays = result.scalars().all()
 
         # Hämta relaterad information för båtar och platser
         boat_ids = {stay.boat_id for stay in stays}
         slot_ids = {stay.slot_id for stay in stays}
 
-        boats = {boat.id: boat for boat in db.query(
-            Boat).filter(Boat.id.in_(boat_ids)).all()}
-        slots = {slot.id: slot for slot in db.query(
-            Slot).filter(Slot.id.in_(slot_ids)).all()}
+        boats_query = select(Boat).filter(Boat.id.in_(boat_ids))
+        slots_query = select(Slot).filter(Slot.id.in_(slot_ids))
+
+        boats_result = await db.execute(boats_query)
+        slots_result = await db.execute(slots_query)
+
+        boats = {boat.id: boat for boat in boats_result.scalars().all()}
+        slots = {slot.id: slot for slot in slots_result.scalars().all()}
 
         # Formatera resultat
         result = []
@@ -1148,53 +1169,51 @@ async def get_stays(
             status_code=500, detail=f"Failed to fetch stays: {error}")
 
 
+class BoatStayData(BaseModel):
+    boat_id: int
+    slot_id: int
+    start_time: datetime
+    end_time: datetime
+
+
+class SaveSolutionRequest(BaseModel):
+    strategy_name: str
+    boat_stays: List[BoatStayData]
+
+
 @app.post("/api/save-solution", response_model=Dict[str, Any], tags=["Optimization"])
 async def save_solution(
-    strategy_name: str = Query(...,
-                               description="Name of the strategy to save"),
-    boat_stays: List[Dict[str, Any]
-                     ] = Query(..., description="List of boat stay assignments"),
-    db: Session = Depends(get_db)
+    request: SaveSolutionRequest,
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Spara en specifik lösning (placeringar) till databasen.
 
     Args:
-        strategy_name: Namn på strategin som genererade placeringarna
-        boat_stays: Lista med placeringar (båt_id, plats_id, start_tid, slut_tid)
+        request: Request data containing strategy name and boat stays
     """
     try:
-        logger.info(f"Saving solution for strategy: {strategy_name}")
+        logger.info(f"Saving solution for strategy: {request.strategy_name}")
 
         # Ta bort befintliga vistelser med denna strategi
-        db.query(BoatStay).filter(
-            BoatStay.strategy_name == strategy_name).delete()
+        await db.execute(delete(BoatStay).filter(
+            BoatStay.strategy_name == request.strategy_name))
 
         # Validera indata
-        for stay_data in boat_stays:
-            required_fields = ["boat_id", "slot_id", "start_time", "end_time"]
-            for field in required_fields:
-                if field not in stay_data:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Missing required field: {field} in boat stay data"
-                    )
-
+        for stay_data in request.boat_stays:
             # Kontrollera att båten och platsen finns
-            boat = db.query(Boat).filter(
-                Boat.id == stay_data["boat_id"]).first()
+            boat = await db.get(Boat, stay_data.boat_id)
             if not boat:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Boat with ID {stay_data['boat_id']} not found"
+                    detail=f"Boat with ID {stay_data.boat_id} not found"
                 )
 
-            slot = db.query(Slot).filter(
-                Slot.id == stay_data["slot_id"]).first()
+            slot = await db.get(Slot, stay_data.slot_id)
             if not slot:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Slot with ID {stay_data['slot_id']} not found"
+                    detail=f"Slot with ID {stay_data.slot_id} not found"
                 )
 
             # Kontrollera att båten passar på platsen
@@ -1206,42 +1225,31 @@ async def save_solution(
 
         # Skapa nya boat_stays-poster
         new_stays = []
-        for stay_data in boat_stays:
-            # Konvertera strängar till datetime om de inte redan är det
-            start_time = stay_data["start_time"]
-            if isinstance(start_time, str):
-                start_time = datetime.fromisoformat(
-                    start_time.replace("Z", "+00:00"))
-
-            end_time = stay_data["end_time"]
-            if isinstance(end_time, str):
-                end_time = datetime.fromisoformat(
-                    end_time.replace("Z", "+00:00"))
-
+        for stay_data in request.boat_stays:
             stay = BoatStay(
-                boat_id=stay_data["boat_id"],
-                slot_id=stay_data["slot_id"],
-                start_time=start_time,
-                end_time=end_time,
-                strategy_name=strategy_name
+                boat_id=stay_data.boat_id,
+                slot_id=stay_data.slot_id,
+                start_time=stay_data.start_time,
+                end_time=stay_data.end_time,
+                strategy_name=request.strategy_name
             )
             new_stays.append(stay)
 
-        db.add_all(new_stays)
-        db.commit()
+        await db.add_all(new_stays)
+        await db.commit()
 
         logger.info(
-            f"Saved {len(new_stays)} boat placements for strategy '{strategy_name}'")
+            f"Saved {len(new_stays)} boat placements for strategy '{request.strategy_name}'")
 
         return {
-            "message": f"Saved {len(new_stays)} boat placements for strategy '{strategy_name}'",
+            "message": f"Saved {len(new_stays)} boat placements for strategy '{request.strategy_name}'",
             "stays_count": len(new_stays)
         }
     except HTTPException:
         # Vidarebefordra HTTP-undantag
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to save solution: {error}")
@@ -1250,4 +1258,4 @@ async def save_solution(
 if __name__ == "__main__":
     import uvicorn
     logger.info(f"Starting {settings.APP_NAME} v{settings.VERSION}")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)

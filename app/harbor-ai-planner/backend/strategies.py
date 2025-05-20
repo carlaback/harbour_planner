@@ -1,5 +1,5 @@
 from typing import List, Dict, Any, Tuple
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime
 import random
 
@@ -13,7 +13,7 @@ class BaseStrategy:
         self.name = name
         self.description = description or f"{name} strategy"
 
-    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+    async def place_boats(self, db: AsyncSession, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
         """Huvudfunktion som alla strategier implementerar"""
         raise NotImplementedError("Subklasser måste implementera place_boats")
 
@@ -30,12 +30,11 @@ class BaseStrategy:
             if slot.available_from and slot.available_until:
                 if not (slot.available_from <= boat.arrival and slot.available_until >= boat.departure):
                     return False
-
             else:
                 # Permanent plats utan tillgänglig period
                 return False
 
-                # Kontrollera om platsen redan är upptagen av en annan båt under den här perioden
+        # Kontrollera om platsen redan är upptagen av en annan båt under den här perioden
         for stay in existing_stays:
             if stay.slot_id == slot.id:
                 # Kolla om båtens vistelse överlappar med en befintlig vistelse
@@ -68,7 +67,7 @@ class LargestFirstStrategy(BaseStrategy):
             "Prioriterar de bredaste båtarna först för att säkerställa att stora båtar får plats"
         )
 
-    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+    async def place_boats(self, db: AsyncSession, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
         # Sortera båtar efter bredd (störst först)
         sorted_boats = sorted(boats, key=lambda b: b.width, reverse=True)
         existing_stays = []
@@ -104,7 +103,7 @@ class SmallestFirstStrategy(BaseStrategy):
             "Prioriterar de smalaste båtarna först för att maximera antalet placerade båtar"
         )
 
-    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+    async def place_boats(self, db: AsyncSession, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
         # Sortera båtar efter bredd (minst först)
         sorted_boats = sorted(boats, key=lambda b: b.width)
         existing_stays = []
@@ -138,7 +137,7 @@ class BestFitStrategy(BaseStrategy):
             "Placerar varje båt på den plats som ger minst outnyttjad bredd (minimerar spillyta)"
         )
 
-    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+    async def place_boats(self, db: AsyncSession, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
         # Sortera båtar efter ankomsttid
         sorted_boats = sorted(boats, key=lambda b: b.arrival)
         existing_stays = []
@@ -173,7 +172,7 @@ class EarliestArrivalFirstStrategy(BaseStrategy):
             "Prioriterar båtar med tidigast ankomsttid ('först till kvarn'-princip)"
         )
 
-    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+    async def place_boats(self, db: AsyncSession, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
         # Sortera båtar efter ankomsttid (tidigast först)
         sorted_boats = sorted(boats, key=lambda b: b.arrival)
         existing_stays = []
@@ -207,7 +206,7 @@ class TemporaryFirstStrategy(BaseStrategy):
             "Prioriterar att fylla temporärt tillgängliga platser först för att maximera nyttjandet av dessa"
         )
 
-    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+    async def place_boats(self, db: AsyncSession, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
         # Sortera båtar efter ankomsttid
         sorted_boats = sorted(boats, key=lambda b: b.arrival)
         existing_stays = []
@@ -245,17 +244,18 @@ class TemporaryFirstStrategy(BaseStrategy):
 
 
 class RandomStrategy(BaseStrategy):
-    """Strategi: Placera båtar slumpmässigt"""
+    """Strategi: Placera båtar i slumpmässig ordning"""
 
     def __init__(self):
         super().__init__(
             "random",
-            "Placerar båtar i slumpmässig ordning (baslinje för jämförelse)"
+            "Placerar båtar i slumpmässig ordning (används som kontroll)"
         )
 
-    def place_boats(self, db: Session, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
+    async def place_boats(self, db: AsyncSession, boats: List[Boat], slots: List[Slot]) -> List[BoatStay]:
         # Slumpa ordningen på båtarna
-        shuffled_boats = random.sample(boats, len(boats))
+        shuffled_boats = boats.copy()
+        random.shuffle(shuffled_boats)
         existing_stays = []
 
         for boat in shuffled_boats:
@@ -263,12 +263,12 @@ class RandomStrategy(BaseStrategy):
                 boat, slots, existing_stays)
 
             if available_slots:
-                # Välj en slumpmässig plats bland de tillgängliga
-                chosen_slot = random.choice(available_slots)
+                # Välj en slumpmässig plats
+                best_slot = random.choice(available_slots)
 
                 stay = BoatStay(
                     boat_id=boat.id,
-                    slot_id=chosen_slot.id,
+                    slot_id=best_slot.id,
                     start_time=boat.arrival,
                     end_time=boat.departure,
                     strategy_name=self.name
@@ -278,20 +278,20 @@ class RandomStrategy(BaseStrategy):
         return existing_stays
 
 
-# Skapa en lista över alla tillgängliga strategier
+# Lista över alla tillgängliga strategier
 ALL_STRATEGIES = [
     LargestFirstStrategy(),
     SmallestFirstStrategy(),
     BestFitStrategy(),
     EarliestArrivalFirstStrategy(),
     TemporaryFirstStrategy(),
-    RandomStrategy(),
+    RandomStrategy()
 ]
 
-# Dictionary för enkel åtkomst av strategier via namn
+# Mappning från strateginamn till strategiinstans
 STRATEGY_MAP = {strategy.name: strategy for strategy in ALL_STRATEGIES}
 
 
 def get_strategy_by_name(name: str) -> BaseStrategy:
-    """Hämta en strategi baserat på dess namn"""
+    """Hämta en strategi baserat på namn"""
     return STRATEGY_MAP.get(name)

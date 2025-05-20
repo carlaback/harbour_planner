@@ -1,6 +1,6 @@
 import os
 from typing import List, Dict, Any
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -18,10 +18,10 @@ class Settings(BaseSettings):
     """Databasinställningar"""
 
     # Anslutningssträng till databasen
-    # Format: "postgresql://användare:lösenord@host/databasnamn"
+    # Format: "postgresql+asyncpg://användare:lösenord@host/databasnamn"
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",
-        "postgresql://postgres:password@localhost/harbor_db"
+        "postgresql+asyncpg://postgres:postgres@localhost:5432/harbor_planner"
     )
 
     # Antal anslutningar i pool (för hantering av många samtidiga förfrågningar)
