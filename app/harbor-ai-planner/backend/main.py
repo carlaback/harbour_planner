@@ -18,12 +18,14 @@ import os
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import asyncio
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 
 # ----------------
 # Importera projektspecifika moduler
 # ----------------
 from config import settings
-from models import Base, Boat, Slot, BoatStay
+from models import Base, Boat, Slot, BoatStay, Dock, SlotType, SlotStatus
 from strategies import ALL_STRATEGIES, STRATEGY_MAP, get_strategy_by_name
 from evaluator import StrategyEvaluator
 from gpt_analyzer import GPTAnalyzer
@@ -175,8 +177,10 @@ async def root():
                 "description": "Lista alla tillgängliga strategier"},
             {"path": "/api/boats", "description": "Hantera båtar"},
             {"path": "/api/slots", "description": "Hantera båtplatser"},
+            {"path": "/api/docks", "description": "Hantera bryggor"},
             {"path": "/api/optimize", "description": "Kör optimering och AI-analys"},
-            {"path": "/api/test-data", "description": "Skapa testdata"}
+            {"path": "/api/test-data", "description": "Skapa testdata"},
+            {"path": "/api/harbor-layout", "description": "Skapa hamnlayout"}
         ]
     }
 
@@ -472,6 +476,130 @@ async def delete_boat(boat_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(
             status_code=500, detail=f"Failed to delete boat: {error}")
 
+# --- Dock/bryggor-endpoints ---
+
+
+@app.get("/api/docks", response_model=List[Dict[str, Any]], tags=["Docks"])
+async def get_docks(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Hämta alla bryggor med paginering.
+
+    Args:
+        skip: Antal bryggor att hoppa över (för paginering)
+        limit: Maximalt antal bryggor att returnera
+    """
+    try:
+        docks = await db.execute(select(Dock).offset(skip).limit(limit))
+        docks = docks.scalars().all()
+        return [
+            {
+                "id": dock.id,
+                "name": dock.name,
+                "position_x": dock.position_x,
+                "position_y": dock.position_y,
+                "width": dock.width,
+                "length": dock.length
+            } for dock in docks
+        ]
+    except Exception as e:
+        error = handle_exception(e)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch docks: {error}")
+
+
+@app.get("/api/docks/{dock_id}", response_model=Dict[str, Any], tags=["Docks"])
+async def get_dock(dock_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    Hämta en specifik brygga baserat på ID.
+
+    Args:
+        dock_id: ID för bryggan att hämta
+    """
+    try:
+        dock = await db.get(Dock, dock_id)
+        if not dock:
+            raise HTTPException(
+                status_code=404, detail=f"Dock with ID {dock_id} not found")
+
+        return {
+            "id": dock.id,
+            "name": dock.name,
+            "position_x": dock.position_x,
+            "position_y": dock.position_y,
+            "width": dock.width,
+            "length": dock.length
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        error = handle_exception(e)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch dock: {error}")
+
+
+@app.post("/api/docks", response_model=Dict[str, Any], tags=["Docks"])
+async def create_dock(dock_data: Dict[str, Any], db: AsyncSession = Depends(get_db)):
+    """
+    Skapa en ny brygga.
+
+    Args:
+        dock_data: Data för den nya bryggan (namn, position, storlek)
+    """
+    try:
+        # Validera obligatoriska fält
+        required_fields = ["name", "position_x",
+                           "position_y", "width", "length"]
+        for field in required_fields:
+            if field not in dock_data:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing required field: {field}"
+                )
+
+        # Validera att position och storlek är positiva tal
+        for field in ["position_x", "position_y", "width", "length"]:
+            value = dock_data.get(field)
+            if not isinstance(value, (int, float)) or value < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{field} must be a non-negative number"
+                )
+
+        # Skapa och spara bryggan
+        dock = Dock(
+            name=dock_data["name"],
+            position_x=int(dock_data["position_x"]),
+            position_y=int(dock_data["position_y"]),
+            width=int(dock_data["width"]),
+            length=int(dock_data["length"])
+        )
+
+        db.add(dock)
+        await db.commit()
+        await db.refresh(dock)
+
+        logger.info(f"Created new dock: {dock.name} (ID: {dock.id})")
+
+        return {
+            "id": dock.id,
+            "name": dock.name,
+            "position_x": dock.position_x,
+            "position_y": dock.position_y,
+            "width": dock.width,
+            "length": dock.length
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        error = handle_exception(e)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create dock: {error}")
+
 # --- Plats-endpoints ---
 
 
@@ -479,27 +607,55 @@ async def delete_boat(boat_id: int, db: AsyncSession = Depends(get_db)):
 async def get_slots(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
+    slot_type: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    dock_id: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Hämta alla båtplatser med paginering.
+    Hämta alla båtplatser med paginering och filtrering.
 
     Args:
         skip: Antal platser att hoppa över (för paginering)
         limit: Maximalt antal platser att returnera
+        slot_type: Filtrera efter platstyp (guest, flex, permanent, guest_drop_in)
+        status: Filtrera efter status (available, occupied, reserved, maintenance)
+        dock_id: Filtrera efter brygga-ID
     """
     try:
-        slots = await db.execute(select(Slot).offset(skip).limit(limit))
+        query = select(Slot)
+
+        # Tillämpa filter om de anges
+        if slot_type:
+            query = query.filter(Slot.slot_type == slot_type)
+        if status:
+            query = query.filter(Slot.status == status)
+        if dock_id:
+            query = query.filter(Slot.dock_id == dock_id)
+
+        query = query.offset(skip).limit(limit)
+        slots = await db.execute(query)
         slots = slots.scalars().all()
+
         return [
             {
                 "id": slot.id,
                 "name": slot.name,
+                "position_x": slot.position_x,
+                "position_y": slot.position_y,
+                "width": slot.width,
+                "length": slot.length,
+                "depth": slot.depth,
                 "max_width": slot.max_width,
+                "slot_type": slot.slot_type,
+                "status": slot.status,
                 "is_reserved": slot.is_reserved,
+                "price_per_day": slot.price_per_day,
                 "available_from": serialize_datetime(slot.available_from),
                 "available_until": serialize_datetime(slot.available_until),
-                "status": slot.get_availability_status()
+                "dock_id": slot.dock_id,
+                "boat_id": slot.boat_id,
+                "status_text": slot.get_availability_status()
             } for slot in slots
         ]
     except Exception as e:
@@ -525,14 +681,23 @@ async def get_slot(slot_id: int, db: AsyncSession = Depends(get_db)):
         return {
             "id": slot.id,
             "name": slot.name,
+            "position_x": slot.position_x,
+            "position_y": slot.position_y,
+            "width": slot.width,
+            "length": slot.length,
+            "depth": slot.depth,
             "max_width": slot.max_width,
+            "slot_type": slot.slot_type,
+            "status": slot.status,
             "is_reserved": slot.is_reserved,
+            "price_per_day": slot.price_per_day,
             "available_from": serialize_datetime(slot.available_from),
             "available_until": serialize_datetime(slot.available_until),
-            "status": slot.get_availability_status()
+            "dock_id": slot.dock_id,
+            "boat_id": slot.boat_id,
+            "status_text": slot.get_availability_status()
         }
     except HTTPException:
-        # Vidarebefordra HTTP-undantag
         raise
     except Exception as e:
         error = handle_exception(e)
@@ -546,11 +711,12 @@ async def create_slot(slot_data: Dict[str, Any], db: AsyncSession = Depends(get_
     Skapa en ny båtplats.
 
     Args:
-        slot_data: Data för den nya platsen (namn, maxbredd, reservationsstatus, etc.)
+        slot_data: Data för den nya platsen
     """
     try:
         # Validera obligatoriska fält
-        required_fields = ["name", "max_width"]
+        required_fields = ["name", "position_x", "position_y",
+                           "width", "length", "max_width", "dock_id", "slot_type"]
         for field in required_fields:
             if field not in slot_data:
                 raise HTTPException(
@@ -558,45 +724,63 @@ async def create_slot(slot_data: Dict[str, Any], db: AsyncSession = Depends(get_
                     detail=f"Missing required field: {field}"
                 )
 
-        # Validera maxbredd
-        if not isinstance(slot_data["max_width"], (int, float)) or slot_data["max_width"] <= 0:
+        # Validera att bryggan finns
+        dock = await db.get(Dock, slot_data["dock_id"])
+        if not dock:
             raise HTTPException(
                 status_code=400,
-                detail="Max width must be a positive number"
+                detail=f"Dock with ID {slot_data['dock_id']} not found"
             )
 
-        # Konvertera strängar till datetime om de anges och inte redan är datetime
-        available_from = None
+        # Skapa plats med alla angivna fält
+        slot_dict = {
+            "name": slot_data["name"],
+            "position_x": int(slot_data["position_x"]),
+            "position_y": int(slot_data["position_y"]),
+            "width": int(slot_data["width"]),
+            "length": int(slot_data["length"]),
+            "max_width": float(slot_data["max_width"]),
+            "dock_id": int(slot_data["dock_id"]),
+            "slot_type": slot_data["slot_type"],
+        }
+
+        # Hantera valfria fält
+        if "depth" in slot_data:
+            slot_dict["depth"] = float(slot_data["depth"])
+        if "status" in slot_data:
+            slot_dict["status"] = slot_data["status"]
+        else:
+            # Permanenta platser är upptagna som standard
+            slot_dict["status"] = "occupied" if slot_data["slot_type"] == "permanent" else "available"
+        if "is_reserved" in slot_data:
+            slot_dict["is_reserved"] = bool(slot_data["is_reserved"])
+        if "price_per_day" in slot_data:
+            slot_dict["price_per_day"] = int(slot_data["price_per_day"])
         if "available_from" in slot_data and slot_data["available_from"]:
             if isinstance(slot_data["available_from"], str):
-                available_from = datetime.fromisoformat(
+                slot_dict["available_from"] = datetime.fromisoformat(
                     slot_data["available_from"].replace("Z", "+00:00"))
             else:
-                available_from = slot_data["available_from"]
-
-        available_until = None
+                slot_dict["available_from"] = slot_data["available_from"]
         if "available_until" in slot_data and slot_data["available_until"]:
             if isinstance(slot_data["available_until"], str):
-                available_until = datetime.fromisoformat(
+                slot_dict["available_until"] = datetime.fromisoformat(
                     slot_data["available_until"].replace("Z", "+00:00"))
             else:
-                available_until = slot_data["available_until"]
+                slot_dict["available_until"] = slot_data["available_until"]
+        if "boat_id" in slot_data:
+            slot_dict["boat_id"] = int(slot_data["boat_id"])
 
         # Validera datumförhållanden om båda datum anges
-        if available_from and available_until and available_from >= available_until:
-            raise HTTPException(
-                status_code=400,
-                detail="available_until must be after available_from"
-            )
+        if "available_from" in slot_dict and "available_until" in slot_dict:
+            if slot_dict["available_from"] >= slot_dict["available_until"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="available_until must be after available_from"
+                )
 
-        # Skapa och spara platsen
-        slot = Slot(
-            name=slot_data["name"],
-            max_width=float(slot_data["max_width"]),
-            is_reserved=bool(slot_data.get("is_reserved", False)),
-            available_from=available_from,
-            available_until=available_until
-        )
+        # Skapa och spara slot
+        slot = Slot(**slot_dict)
 
         db.add(slot)
         await db.commit()
@@ -607,14 +791,23 @@ async def create_slot(slot_data: Dict[str, Any], db: AsyncSession = Depends(get_
         return {
             "id": slot.id,
             "name": slot.name,
+            "position_x": slot.position_x,
+            "position_y": slot.position_y,
+            "width": slot.width,
+            "length": slot.length,
+            "depth": slot.depth,
             "max_width": slot.max_width,
+            "slot_type": slot.slot_type,
+            "status": slot.status,
             "is_reserved": slot.is_reserved,
+            "price_per_day": slot.price_per_day,
             "available_from": serialize_datetime(slot.available_from),
             "available_until": serialize_datetime(slot.available_until),
-            "status": slot.get_availability_status()
+            "dock_id": slot.dock_id,
+            "boat_id": slot.boat_id,
+            "status_text": slot.get_availability_status()
         }
     except HTTPException:
-        # Vidarebefordra HTTP-undantag
         raise
     except Exception as e:
         await db.rollback()
@@ -640,39 +833,77 @@ async def update_slot(slot_id: int, slot_data: Dict[str, Any], db: AsyncSession 
                 status_code=404, detail=f"Slot with ID {slot_id} not found")
 
         # Uppdatera fält om de finns i indata
-        if "name" in slot_data:
-            slot.name = slot_data["name"]
+        updated_fields = []
 
-        if "max_width" in slot_data:
-            if not isinstance(slot_data["max_width"], (int, float)) or slot_data["max_width"] <= 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Max width must be a positive number"
-                )
-            slot.max_width = float(slot_data["max_width"])
+        # Uppdatera strängar och enkla värden
+        for field in ["name", "slot_type", "status"]:
+            if field in slot_data:
+                setattr(slot, field, slot_data[field])
+                updated_fields.append(field)
 
+        # Uppdatera numeriska värden med validering
+        for field in ["position_x", "position_y", "width", "length", "max_width", "depth", "price_per_day"]:
+            if field in slot_data:
+                try:
+                    value = float(slot_data[field]) if field in [
+                        "max_width", "depth"] else int(slot_data[field])
+                    if value < 0:
+                        raise ValueError(
+                            f"{field} must be a non-negative number")
+                    setattr(slot, field, value)
+                    updated_fields.append(field)
+                except (ValueError, TypeError) as e:
+                    raise HTTPException(status_code=400, detail=str(e))
+
+        # Uppdatera boolean-värden
         if "is_reserved" in slot_data:
             slot.is_reserved = bool(slot_data["is_reserved"])
+            updated_fields.append("is_reserved")
 
-        # Hantera available_from
-        if "available_from" in slot_data:
-            if slot_data["available_from"] is None:
-                slot.available_from = None
-            elif isinstance(slot_data["available_from"], str):
-                slot.available_from = datetime.fromisoformat(
-                    slot_data["available_from"].replace("Z", "+00:00"))
-            else:
-                slot.available_from = slot_data["available_from"]
+        # Uppdatera relationsID
+        if "dock_id" in slot_data:
+            # Validera att bryggan finns
+            dock = await db.get(Dock, slot_data["dock_id"])
+            if not dock:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Dock with ID {slot_data['dock_id']} not found"
+                )
+            slot.dock_id = int(slot_data["dock_id"])
+            updated_fields.append("dock_id")
 
-        # Hantera available_until
-        if "available_until" in slot_data:
-            if slot_data["available_until"] is None:
-                slot.available_until = None
-            elif isinstance(slot_data["available_until"], str):
-                slot.available_until = datetime.fromisoformat(
-                    slot_data["available_until"].replace("Z", "+00:00"))
+        if "boat_id" in slot_data:
+            if slot_data["boat_id"] is None:
+                slot.boat_id = None
             else:
-                slot.available_until = slot_data["available_until"]
+                # Validera att båten finns
+                boat = await db.get(Boat, slot_data["boat_id"])
+                if not boat:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Boat with ID {slot_data['boat_id']} not found"
+                    )
+                slot.boat_id = int(slot_data["boat_id"])
+            updated_fields.append("boat_id")
+
+        # Uppdatera datetime-värden
+        for field in ["available_from", "available_until"]:
+            if field in slot_data:
+                if slot_data[field] is None:
+                    setattr(slot, field, None)
+                elif isinstance(slot_data[field], str):
+                    try:
+                        date_value = datetime.fromisoformat(
+                            slot_data[field].replace("Z", "+00:00"))
+                        setattr(slot, field, date_value)
+                    except ValueError:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid date format for {field}. Use ISO format."
+                        )
+                else:
+                    setattr(slot, field, slot_data[field])
+                updated_fields.append(field)
 
         # Validera datumförhållanden om båda datum finns
         if slot.available_from and slot.available_until and slot.available_from >= slot.available_until:
@@ -681,20 +912,38 @@ async def update_slot(slot_id: int, slot_data: Dict[str, Any], db: AsyncSession 
                 detail="available_until must be after available_from"
             )
 
+        # Permanenta platser ska inte kunna sättas som tillgängliga
+        if slot.slot_type == SlotType.PERMANENT and slot.status == SlotStatus.AVAILABLE:
+            raise HTTPException(
+                status_code=400,
+                detail="Permanent slots cannot be set to available status"
+            )
+
         # Spara ändringarna
         await db.commit()
         await db.refresh(slot)
 
-        logger.info(f"Updated slot: {slot.name} (ID: {slot.id})")
+        logger.info(
+            f"Updated slot {slot.id} fields: {', '.join(updated_fields)}")
 
         return {
             "id": slot.id,
             "name": slot.name,
+            "position_x": slot.position_x,
+            "position_y": slot.position_y,
+            "width": slot.width,
+            "length": slot.length,
+            "depth": slot.depth,
             "max_width": slot.max_width,
+            "slot_type": slot.slot_type,
+            "status": slot.status,
             "is_reserved": slot.is_reserved,
+            "price_per_day": slot.price_per_day,
             "available_from": serialize_datetime(slot.available_from),
             "available_until": serialize_datetime(slot.available_until),
-            "status": slot.get_availability_status()
+            "dock_id": slot.dock_id,
+            "boat_id": slot.boat_id,
+            "status_text": slot.get_availability_status()
         }
     except HTTPException:
         # Vidarebefordra HTTP-undantag
@@ -704,6 +953,73 @@ async def update_slot(slot_id: int, slot_data: Dict[str, Any], db: AsyncSession 
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to update slot: {error}")
+
+
+@app.put("/api/slots/{slot_id}/status", response_model=Dict[str, Any], tags=["Slots"])
+async def update_slot_status(
+    slot_id: int,
+    status_data: Dict[str, str],
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Uppdatera status för en specifik båtplats.
+
+    Args:
+        slot_id: ID för platsen att uppdatera
+        status_data: Dictionary med ny status ("status" fältet)
+    """
+    try:
+        # Validera indata
+        if "status" not in status_data:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing required field: status"
+            )
+
+        # Validera att statusvärdet är giltigt
+        new_status = status_data["status"]
+        valid_statuses = [s.value for s in SlotStatus]
+        if new_status not in valid_statuses:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status value. Must be one of: {', '.join(valid_statuses)}"
+            )
+
+        # Hämta platsen
+        slot = await db.get(Slot, slot_id)
+        if not slot:
+            raise HTTPException(
+                status_code=404, detail=f"Slot with ID {slot_id} not found")
+
+        # Kontrollera om platsen är permanent och skydda mot status-ändringar
+        if slot.slot_type == SlotType.PERMANENT and new_status == SlotStatus.AVAILABLE:
+            raise HTTPException(
+                status_code=400,
+                detail="Permanent slots cannot be set to available status"
+            )
+
+        # Uppdatera status
+        slot.status = new_status
+        await db.commit()
+        await db.refresh(slot)
+
+        logger.info(f"Updated status of slot {slot.id} to {new_status}")
+
+        return {
+            "id": slot.id,
+            "name": slot.name,
+            "slot_type": slot.slot_type,
+            "status": slot.status,
+            "status_text": slot.get_availability_status(),
+            "message": f"Status updated to {new_status}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        error = handle_exception(e)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to update slot status: {error}")
 
 
 @app.delete("/api/slots/{slot_id}", response_model=Dict[str, Any], tags=["Slots"])
@@ -827,71 +1143,119 @@ async def _perform_optimization(db: AsyncSession, strategy_names: List[str] = No
         logger.info(
             f"Optimizing placement for {len(boats)} boats and {len(slots)} slots")
 
-        # Om inga strategier specificerats, använd standardstrategierna
+        # Om inga strategier specificerats, använd alla tillgängliga
         if not strategy_names:
-            strategy_names = settings.DEFAULT_STRATEGIES
+            strategy_names = [s.name for s in ALL_STRATEGIES]
 
         logger.info(f"Using strategies: {', '.join(strategy_names)}")
 
-        # Hitta strategierna
+        # Hitta strategierna med debug-information
         strategies = []
+        logger.info(f"Looking for strategies: {strategy_names}")
+        logger.info(
+            f"Available strategies in STRATEGY_MAP: {list(STRATEGY_MAP.keys())}")
+
         for name in strategy_names:
             strategy = get_strategy_by_name(name)
             if strategy:
                 strategies.append(strategy)
+                # DEBUG: Logga vilken strategiklass som faktiskt laddas
+                logger.info(
+                    f"✅ Loaded strategy '{name}' -> {type(strategy).__name__} (object id: {id(strategy)})")
+            else:
+                logger.warning(f"❌ Strategy '{name}' not found")
+
+        # DEBUG: Kontrollera att vi har olika strategiobjekt
+        if strategies:
+            strategy_types = [type(s).__name__ for s in strategies]
+            logger.info(f"Final strategy types loaded: {strategy_types}")
+            # Kontrollera om alla strategier är samma objekt
+            unique_objects = len(set(id(s) for s in strategies))
+            logger.info(
+                f"Number of unique strategy objects: {unique_objects} (should be {len(strategies)})")
+        else:
+            logger.error("No strategies loaded!")
 
         if not strategies:
             raise HTTPException(
                 status_code=400, detail="No valid strategies specified")
 
-        # Kör alla valda strategier
         all_results = {}
+        evaluations = {}
+
         for strategy in strategies:
             strategy_start = time.time()
             logger.info(f"Running strategy: {strategy.name}")
 
-            # Implementera timeout-skydd
-            boat_stays = await strategy.place_boats(db, boats, slots)
-
-            all_results[strategy.name] = boat_stays
-
-            strategy_time = time.time() - strategy_start
-            logger.info(
-                f"Strategy {strategy.name} completed in {strategy_time:.2f}s with {len(boat_stays)} placements")
-
-        # Utvärdera resultaten från alla strategier
-        logger.info("Evaluating strategy results")
-        evaluations = await StrategyEvaluator.evaluate_all_strategies(
-            db, all_results, boats, slots)
-
-        # Skapa en detaljerad utvärdering med mer information
-        detailed_evaluation = await StrategyEvaluator.get_detailed_evaluation(
-            db, all_results, boats, slots)
-
-        # Använd GPT för att analysera resultaten om API-nyckel finns
-        if settings.OPENAI_API_KEY:
-            logger.info("Starting GPT analysis")
             try:
-                gpt_analyzer = GPTAnalyzer(api_key=settings.OPENAI_API_KEY)
-                gpt_analysis = await gpt_analyzer.analyze_strategies(
-                    evaluations, boats, slots
-                )
-                logger.info("GPT analysis completed successfully")
-            except Exception as e:
-                logger.error(f"GPT analysis failed: {str(e)}")
-                # Fallback om GPT-analys misslyckas
-                gpt_analysis = {
-                    "error": f"Failed to analyze with GPT: {str(e)}",
-                    "best_strategy": max(evaluations.items(), key=lambda x: x[1].get('score', 0))[0],
-                    "recommendations": []
+                # Kör strategin
+                boat_stays = await strategy.place_boats(db, boats, slots)
+                all_results[strategy.name] = boat_stays
+
+                # Enkel utvärdering direkt här
+                boats_placed = len(set(stay.boat_id for stay in boat_stays))
+                placement_rate = boats_placed / len(boats) if boats else 0
+
+                # Beräkna utnyttjandegrad
+                total_utilization = 0
+                utilization_count = 0
+                for stay in boat_stays:
+                    boat = next(
+                        (b for b in boats if b.id == stay.boat_id), None)
+                    slot = next(
+                        (s for s in slots if s.id == stay.slot_id), None)
+                    if boat and slot and slot.max_width > 0:
+                        total_utilization += boat.width / slot.max_width
+                        utilization_count += 1
+
+                avg_utilization = total_utilization / \
+                    utilization_count if utilization_count > 0 else 0
+
+                evaluations[strategy.name] = {
+                    "boats_placed": boats_placed,
+                    "total_boats": len(boats),
+                    "placement_rate": placement_rate,
+                    "utilization": avg_utilization,
+                    "score": placement_rate  # Använd placement_rate som score
                 }
+
+                strategy_time = time.time() - strategy_start
+                logger.info(
+                    f"Strategy {strategy.name} completed in {strategy_time:.2f}s with {boats_placed} boats placed")
+
+            except Exception as e:
+                logger.error(f"Strategy {strategy.name} failed: {str(e)}")
+                evaluations[strategy.name] = {
+                    "boats_placed": 0,
+                    "total_boats": len(boats),
+                    "placement_rate": 0,
+                    "utilization": 0,
+                    "score": 0,
+                    "error": str(e)
+                }
+
+        # Skapa en detaljerad utvärdering (tom för nu)
+        detailed_evaluation = {}
+
+        # Hitta bästa strategin
+        if evaluations:
+            best_strategy_name = max(
+                evaluations.items(), key=lambda x: x[1].get('boats_placed', 0))[0]
+            best_boats_placed = evaluations[best_strategy_name].get(
+                'boats_placed', 0)
         else:
-            logger.warning("No OpenAI API key provided, skipping GPT analysis")
-            gpt_analysis = {
-                "error": "No OpenAI API key configured",
-                "best_strategy": max(evaluations.items(), key=lambda x: x[1].get('score', 0))[0],
-                "recommendations": []
-            }
+            best_strategy_name = "ingen"
+            best_boats_placed = 0
+
+        # Skapa enkel AI-analys (utan GPT för nu)
+        gpt_analysis = {
+            "best_strategy": best_strategy_name,
+            "recommendations": [
+                f"Automatisk optimering valde strategin '{best_strategy_name}' som placerade {best_boats_placed} av {len(boats)} båtar.",
+                f"Placeringsgrad: {(best_boats_placed / len(boats) * 100):.1f}%" if len(
+                    boats) > 0 else "Inga båtar att placera."
+            ]
+        }
 
         total_time = time.time() - start_time
         logger.info(f"Optimization process completed in {total_time:.2f}s")
@@ -994,6 +1358,19 @@ async def create_test_data(
         await db.execute(delete(BoatStay))
         await db.execute(delete(Boat))
         await db.execute(delete(Slot))
+        await db.execute(delete(Dock))
+
+        # Skapa testdock
+        dock = Dock(
+            name="Test Dock",
+            position_x=100,
+            position_y=100,
+            width=500,
+            length=50
+        )
+        db.add(dock)
+        await db.commit()
+        await db.refresh(dock)
 
         # Beräkna antal platser av varje typ
         regular_slots_count = int(
@@ -1010,8 +1387,22 @@ async def create_test_data(
             # Varierande bredder mellan 2.5m och 6.0m
             # Ger bredder från 2.5, 3.0, 3.5... till 6.0
             width = 2.5 + (i % 8) * 0.5
+            slot_width = int(width * 10)  # Konvertera till pixlar för position
             slots.append(
-                Slot(name=f"Plats {i}", max_width=width, is_reserved=False)
+                Slot(
+                    name=f"Plats {i}",
+                    position_x=100 + ((i-1) % 10) * (slot_width + 5),
+                    position_y=150 + ((i-1) // 10) * 85,
+                    width=slot_width,
+                    length=80,
+                    depth=2.5 + (i % 5) * 0.2,
+                    max_width=width,
+                    slot_type=SlotType.GUEST,
+                    status=SlotStatus.AVAILABLE,
+                    is_reserved=False,
+                    price_per_day=400 + (i % 3) * 50,
+                    dock_id=dock.id
+                )
             )
 
         # Temporärt tillgängliga platser
@@ -1019,24 +1410,44 @@ async def create_test_data(
         summer_end = datetime(2023, 8, 31)
         for i in range(regular_slots_count + 1, regular_slots_count + temp_slots_count + 1):
             width = 3.0 + (i % 7) * 0.5
+            slot_width = int(width * 10)
             slots.append(
                 Slot(
                     name=f"Temp {i}",
+                    position_x=100 + ((i-1) % 10) * (slot_width + 5),
+                    position_y=350 + ((i-1) // 10) * 85,
+                    width=slot_width,
+                    length=80,
+                    depth=2.8 + (i % 5) * 0.2,
                     max_width=width,
+                    slot_type=SlotType.FLEX,
+                    status=SlotStatus.AVAILABLE,
                     is_reserved=True,
                     available_from=summer_start,
-                    available_until=summer_end
+                    available_until=summer_end,
+                    price_per_day=450 + (i % 3) * 50,
+                    dock_id=dock.id
                 )
             )
 
         # Permanent reserverade platser
         for i in range(regular_slots_count + temp_slots_count + 1, slots_count + 1):
             width = 3.5 + (i % 6) * 0.5
+            slot_width = int(width * 10)
             slots.append(
                 Slot(
                     name=f"Reserv {i}",
+                    position_x=100 + ((i-1) % 10) * (slot_width + 5),
+                    position_y=550 + ((i-1) // 10) * 85,
+                    width=slot_width,
+                    length=80,
+                    depth=3.0 + (i % 5) * 0.2,
                     max_width=width,
-                    is_reserved=True
+                    slot_type=SlotType.PERMANENT,
+                    status=SlotStatus.OCCUPIED,
+                    is_reserved=True,
+                    price_per_day=500 + (i % 3) * 50,
+                    dock_id=dock.id
                 )
             )
 
@@ -1095,6 +1506,219 @@ async def create_test_data(
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to create test data: {error}")
+
+
+@app.post("/api/harbor-layout", response_model=Dict[str, Any], tags=["Test Data"])
+async def create_harbor_layout(db: AsyncSession = Depends(get_db)):
+    """
+    Skapa en layout för hamnen baserad på en fördefinierad layout.
+    Denna funktion skapar bryggor och båtplatser enligt en specifik layout.
+    """
+    try:
+        logger.info("Creating harbor layout with docks and slots")
+
+        # Rensa befintliga data
+        await db.execute(delete(Slot))
+        await db.execute(delete(Dock))
+
+        # Skapa bryggorna
+        docks = [
+            # Översta bryggorna (501-530)
+            Dock(name="Brygga A", position_x=300,
+                 position_y=70, width=320, length=40),
+            Dock(name="Brygga B", position_x=300,
+                 position_y=130, width=280, length=40),
+
+            # Mittenområdet (401-455)
+            Dock(name="Brygga C", position_x=280,
+                 position_y=270, width=40, length=440),
+            Dock(name="Brygga D", position_x=370,
+                 position_y=340, width=40, length=140),
+            Dock(name="Brygga E", position_x=460,
+                 position_y=340, width=40, length=300),
+            Dock(name="Brygga F", position_x=550,
+                 position_y=340, width=40, length=300),
+
+            # Nedre bryggorna (301-346)
+            Dock(name="Brygga G", position_x=280,
+                 position_y=750, width=450, length=40),
+            Dock(name="Brygga H", position_x=280,
+                 position_y=810, width=450, length=40),
+
+            # Gästhamn (201-246)
+            Dock(name="Gästhamn", position_x=150,
+                 position_y=990, width=600, length=40),
+
+            # Nedersta bryggorna (101-181)
+            Dock(name="Brygga J", position_x=150,
+                 position_y=1190, width=600, length=40),
+            Dock(name="Brygga K", position_x=150,
+                 position_y=1280, width=600, length=40),
+
+            # Udden (50-59)
+            Dock(name="Udden", position_x=75,
+                 position_y=1330, width=30, length=200)
+        ]
+
+        await db.add_all(docks)
+        await db.commit()
+
+        # Hämta de nya bryggorna för att få deras IDs
+        result = await db.execute(select(Dock))
+        saved_docks = {dock.name: dock for dock in result.scalars().all()}
+
+        # Skapa platserna
+        slots = []
+
+        # Hjälpfunktion för att skapa en rad med platser
+        def create_slot_row(start_id, count, start_x, start_y, width, length, is_vertical, spacing,
+                            dock_name, slot_type, status="available", depth=2.5, price=400):
+            dock = saved_docks[dock_name]
+            row_slots = []
+            for i in range(count):
+                slot_id = start_id + i
+                x = start_x if is_vertical else start_x + i * (width + spacing)
+                y = start_y + i * \
+                    (length + spacing) if is_vertical else start_y
+
+                # Certain slot IDs are available based on image
+                special_status = status
+                if slot_id in [407, 403, 314, 437] and slot_type == "permanent":
+                    special_status = "available"
+
+                row_slots.append(
+                    Slot(
+                        id=slot_id,
+                        name=str(slot_id),
+                        position_x=x,
+                        position_y=y,
+                        width=width,
+                        length=length,
+                        depth=depth + (i % 5) * 0.2,  # Variera djupet lite
+                        max_width=width * 0.9,  # Maxbredd något mindre än faktisk bredd
+                        slot_type=slot_type,
+                        status=special_status,
+                        is_reserved=(slot_type != "guest"),
+                        # Variera priset lite
+                        price_per_day=price + (i % 3) * 50,
+                        dock_id=dock.id
+                    )
+                )
+            return row_slots
+
+        # Översta bryggorna (501-530)
+        slots.extend(create_slot_row(501, 5, 310, 80, 30,
+                     30, False, 5, "Brygga A", "flex"))
+        slots.extend(create_slot_row(510, 10, 310, 140,
+                     25, 30, False, 5, "Brygga B", "flex"))
+
+        # Mittenområdet (401-456)
+        slots.extend(create_slot_row(401, 17, 250, 320, 25, 30,
+                     True, 5, "Brygga C", "permanent", "occupied"))
+        slots.extend(create_slot_row(420, 10, 340, 360,
+                     25, 30, True, 5, "Brygga D", "flex"))
+        slots.extend(create_slot_row(430, 10, 430, 360,
+                     25, 30, True, 5, "Brygga E", "flex"))
+        slots.extend(create_slot_row(440, 10, 520, 360,
+                     25, 30, True, 5, "Brygga F", "flex"))
+
+        # Nedre bryggorna (301-346)
+        slots.extend(create_slot_row(301, 23, 290, 720,
+                     20, 30, False, 3, "Brygga G", "flex"))
+        slots.extend(create_slot_row(324, 23, 290, 780,
+                     20, 30, False, 3, "Brygga H", "flex"))
+
+        # Gästhamn (201-246)# Gästhamn (201-246)
+        slots.extend(create_slot_row(201, 25, 160, 960, 20,
+                     30, False, 3, "Gästhamn", "guest"))
+
+        # Nedersta bryggorna (101-181)
+        slots.extend(create_slot_row(101, 40, 160, 1160, 15, 30,
+                     False, 2, "Brygga J", "permanent", "occupied"))
+        slots.extend(create_slot_row(141, 40, 160, 1250, 15, 30,
+                     False, 2, "Brygga K", "permanent", "occupied"))
+
+        # Udden (50-5
+        slots.extend(create_slot_row(50, 10, 45, 1340,
+                     20, 18, True, 2, "Udden", "guest"))
+
+        # Drop-in områden
+        slots.append(
+            Slot(
+                id=901,
+                name="Gästhamn DROP-IN 1",
+                position_x=250,
+                position_y=990,
+                width=200,
+                length=40,
+                depth=3.0,
+                max_width=10.0,
+                slot_type="guest_drop_in",
+                status="available",
+                price_per_day=250,
+                dock_id=saved_docks["Gästhamn"].id
+            )
+        )
+
+        slots.append(
+            Slot(
+                id=902,
+                name="Gästhamn DROP-IN 2",
+                position_x=460,
+                position_y=990,
+                width=180,
+                length=40,
+                depth=3.0,
+                max_width=10.0,
+                slot_type="guest_drop_in",
+                status="available",
+                price_per_day=250,
+                dock_id=saved_docks["Gästhamn"].id
+            )
+        )
+
+        # Båstupläggning (text i högerkant på bilden)
+        slots.append(
+            Slot(
+                id=903,
+                name="Båstupläggning",
+                position_x=700,
+                position_y=990,
+                width=40,
+                length=100,
+                depth=0,
+                max_width=0,
+                slot_type="other",
+                status="available",
+                price_per_day=0,
+                dock_id=saved_docks["Gästhamn"].id
+            )
+        )
+
+        # Spara alla platser
+        await db.add_all(slots)
+        await db.commit()
+
+        logger.info(
+            f"Harbor layout created with {len(docks)} docks and {len(slots)} slots")
+
+        return {
+            "message": "Harbor layout created successfully",
+            "docks_count": len(docks),
+            "slots_count": len(slots),
+            "slot_types": {
+                "guest": len([s for s in slots if s.slot_type == "guest"]),
+                "flex": len([s for s in slots if s.slot_type == "flex"]),
+                "permanent": len([s for s in slots if s.slot_type == "permanent"]),
+                "guest_drop_in": len([s for s in slots if s.slot_type == "guest_drop_in"]),
+                "other": len([s for s in slots if s.slot_type == "other"])
+            }
+        }
+    except Exception as e:
+        await db.rollback()
+        error = handle_exception(e)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create harbor layout: {error}")
 
 # --- Vistelse-endpoints ---
 
@@ -1253,6 +1877,21 @@ async def save_solution(
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to save solution: {error}")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    """Hantera valideringsfel med detaljerade meddelanden"""
+    error_detail = {"errors": []}
+    for error in exc.errors():
+        error_detail["errors"].append({
+            "location": error["loc"],
+            "message": error["msg"],
+            "type": error["type"]
+        })
+
+    logger.warning(f"Validation error: {error_detail}")
+    return await request_validation_exception_handler(request, exc)
 
 # Kör servern om denna fil körs direkt
 if __name__ == "__main__":

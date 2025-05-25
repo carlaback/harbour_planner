@@ -2,8 +2,27 @@ from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, St
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
+from enum import Enum
+from sqlalchemy import Index
 
 Base = declarative_base()
+
+
+class SlotType(str, Enum):
+    """Enum för olika typer av båtplatser"""
+    GUEST = "guest"
+    FLEX = "flex"
+    PERMANENT = "permanent"
+    GUEST_DROP_IN = "guest_drop_in"
+    OTHER = "other"
+
+
+class SlotStatus(str, Enum):
+    """Enum för båtplatsernas status"""
+    AVAILABLE = "available"
+    OCCUPIED = "occupied"
+    RESERVED = "reserved"
+    MAINTENANCE = "maintenance"
 
 
 class Boat(Base):
@@ -19,8 +38,8 @@ class Boat(Base):
     arrival = Column(DateTime, nullable=False)  # Ankomsttid
     departure = Column(DateTime, nullable=False)  # Avgångstid
 
-    stays = relationship("BoatStay", back_populates="boat",
-                         cascade="all, delete-orphan")
+    boat_stays = relationship("BoatStay", back_populates="boat",
+                              cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"Boat(id={self.id}, name={self.name}, width={self.width}, arrival={self.arrival}, departure={self.departure})"
@@ -28,6 +47,28 @@ class Boat(Base):
     def is_present_at(self, date_time):
         """Kontrollera om båten är i hamnen vid given tidpunkt"""
         return self.arrival <= date_time <= self.departure
+
+
+class Dock(Base):
+    """
+    Modell för bryggor.
+    Representerar bryggor i hamnen där båtplatser är placerade.
+    """
+    __tablename__ = "docks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+    position_x = Column(Integer, nullable=False)
+    position_y = Column(Integer, nullable=False)
+    width = Column(Integer, nullable=False)
+    length = Column(Integer, nullable=False)
+
+    # Relationer
+    slots = relationship("Slot", back_populates="dock",
+                         cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"Dock(id={self.id}, name={self.name}, pos=({self.position_x},{self.position_y}), size={self.width}x{self.length})"
 
 
 class Slot(Base):
@@ -39,24 +80,43 @@ class Slot(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
+    position_x = Column(Integer, nullable=False)
+    position_y = Column(Integer, nullable=False)
+    width = Column(Integer, nullable=False)
+    length = Column(Integer, nullable=False)
+    depth = Column(Float, nullable=True)
     # Maxbredd för båtar på denna plats
     max_width = Column(Float, nullable=False)
+    slot_type = Column(String, nullable=False,
+                       default=SlotType.GUEST)  # Typ av plats
+    status = Column(String, nullable=False,
+                    default=SlotStatus.AVAILABLE)  # Status
     is_reserved = Column(Boolean, default=False)  # Om platsen är reserverad
+    price_per_day = Column(Integer, nullable=True)  # Pris per dag
     # Om temporärt tillgänglig, från när
     available_from = Column(DateTime, nullable=True)
     # Om temporärt tillgänglig, till när
     available_until = Column(DateTime, nullable=True)
+    dock_id = Column(Integer, ForeignKey("docks.id"), nullable=False)
+    # Aktuell båt på platsen, om någon
+    boat_id = Column(Integer, ForeignKey("boats.id"), nullable=True)
 
-    stays = relationship("BoatStay", back_populates="slot",
-                         cascade="all, delete-orphan")
+    # Relationer
+    boat_stays = relationship(
+        "BoatStay", back_populates="slot", cascade="all, delete-orphan")
+    dock = relationship("Dock", back_populates="slots")
+    boat = relationship("Boat", foreign_keys=[boat_id])
 
     def __repr__(self):
+        status_str = f"status: {self.status}"
         if self.is_reserved and self.available_from and self.available_until:
-            return f"Slot(id={self.id}, name={self.name}, max_width={self.max_width}, reserved but available {self.available_from} to {self.available_until})"
+            reserved_str = f"reserved but available {self.available_from} to {self.available_until}"
         elif self.is_reserved:
-            return f"Slot(id={self.id}, name={self.name}, max_width={self.max_width}, permanently reserved)"
+            reserved_str = "permanently reserved"
         else:
-            return f"Slot(id={self.id}, name={self.name}, max_width={self.max_width}, available)"
+            reserved_str = "available"
+
+        return f"Slot(id={self.id}, name={self.name}, type={self.slot_type}, {status_str}, {reserved_str}, pos=({self.position_x},{self.position_y}))"
 
     def is_available(self, from_time, until_time):
         """
@@ -69,6 +129,10 @@ class Slot(Base):
         Returns:
             bool: True om platsen är tillgänglig under hela perioden, annars False
         """
+        # Om platsen har en status som inte är tillgänglig, returnera False
+        if self.status != SlotStatus.AVAILABLE:
+            return False
+
         # Om platsen är reserverad, måste vi kontrollera tillgänglighetsperioden
         if self.is_reserved:
             # Om platsen är permanent reserverad (utan tillgänglighetsperiod)
@@ -96,15 +160,24 @@ class Slot(Base):
         if current_date is None:
             current_date = datetime.now()
 
-        if not self.is_reserved:
-            return "Tillgänglig"
-        elif self.is_reserved and not (self.available_from and self.available_until):
-            return "Permanent reserverad"
-        elif (self.available_from and self.available_until and
-              self.available_from <= current_date <= self.available_until):
-            return f"Temporärt tillgänglig till {self.available_until.strftime('%Y-%m-%d')}"
-        else:
+        # Returnera aktuell status
+        if self.status == SlotStatus.AVAILABLE:
+            if self.slot_type == SlotType.PERMANENT:
+                return "Permanent plats (ledig)"
+            elif self.slot_type == SlotType.FLEX:
+                return "Flexplats (ledig)"
+            elif self.slot_type == SlotType.GUEST_DROP_IN:
+                return "Gästhamn drop-in (ledig)"
+            else:
+                return "Gästplats (ledig)"
+        elif self.status == SlotStatus.OCCUPIED:
+            return "Upptagen"
+        elif self.status == SlotStatus.RESERVED:
             return "Reserverad"
+        elif self.status == SlotStatus.MAINTENANCE:
+            return "Underhåll"
+        else:
+            return "Okänd status"
 
 
 class BoatStay(Base):
@@ -122,8 +195,8 @@ class BoatStay(Base):
     # Vilken strategi som genererade denna placering
     strategy_name = Column(String, nullable=True)
 
-    boat = relationship("Boat", back_populates="stays")
-    slot = relationship("Slot", back_populates="stays")
+    boat = relationship("Boat", back_populates="boat_stays")
+    slot = relationship("Slot", back_populates="boat_stays")
 
     def __repr__(self):
         return f"BoatStay(id={self.id}, boat_id={self.boat_id}, slot_id={self.slot_id}, start={self.start_time}, end={self.end_time})"
@@ -140,8 +213,8 @@ class BoatStay(Base):
         """
         # Överlappning sker om en vistelse börjar innan den andra slutar
         # och slutar efter att den andra börjar
-        return (max(self.start_time, other_stay.start_time) <
-                min(self.end_time, other_stay.end_time))
+        return (max(self.start_time, other_stay.start_time)
+                < min(self.end_time, other_stay.end_time))
 
     def duration_days(self):
         """Beräkna vistelsens längd i dagar"""
