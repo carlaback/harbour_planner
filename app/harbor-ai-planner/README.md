@@ -32,8 +32,8 @@ uvicorn main:app --reload
 
 Test with sample data:
 ```bash
-curl -X POST "localhost:8000/api/test-data?boats_count=50"
-curl -X POST "localhost:8000/api/optimize"
+curl -X POST "localhost:8001/api/test-data?boats_count=50"
+curl -X POST "localhost:8001/api/optimize"
 ```
 
 ## Performance
