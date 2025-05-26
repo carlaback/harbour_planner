@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Table
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Table, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -23,6 +23,23 @@ class SlotStatus(str, Enum):
     OCCUPIED = "occupied"
     RESERVED = "reserved"
     MAINTENANCE = "maintenance"
+
+
+class AnalysisType(str, Enum):
+    """Enum för olika typer av AI-analyser"""
+    STRATEGY_COMPARISON = "strategy_comparison"
+    OPTIMIZATION = "optimization"
+    RECOMMENDATION = "recommendation"
+    QUESTION_ANSWER = "question_answer"
+    PERFORMANCE_ANALYSIS = "performance_analysis"
+
+
+class ConfidenceLevel(str, Enum):
+    """Enum för AI-konfidensnivåer"""
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    VERY_HIGH = "very_high"
 
 
 class Boat(Base):
@@ -221,3 +238,254 @@ class BoatStay(Base):
         delta = self.end_time - self.start_time
         # Konvertera sekunder till dagar
         return delta.days + (delta.seconds / 86400)
+
+
+class OptimizationRun(Base):
+    """
+    Modell för optimeringskörninngar.
+    Sparar metadata om varje optimering som utförs.
+    """
+    __tablename__ = "optimization_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Grundläggande metadata
+    timestamp = Column(DateTime, nullable=False,
+                       default=datetime.utcnow, index=True)
+    execution_time_seconds = Column(Float, nullable=False)
+
+    # Input-parametrar
+    boats_count = Column(Integer, nullable=False)
+    slots_count = Column(Integer, nullable=False)
+    strategies_used = Column(JSON, nullable=False)  # Lista med strateginamn
+
+    # Resultat-metadata
+    best_strategy = Column(String, nullable=True)
+    boats_placed = Column(Integer, nullable=False, default=0)
+    placement_rate = Column(Float, nullable=False, default=0.0)
+
+    # Koppla till AI-analys
+    ai_analysis_id = Column(Integer, ForeignKey(
+        "ai_analyses.id"), nullable=True)
+
+    # Relationer
+    ai_analysis = relationship(
+        "AIAnalysis", back_populates="optimization_runs")
+    strategy_results = relationship(
+        "StrategyResult", back_populates="optimization_run", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"OptimizationRun(id={self.id}, timestamp={self.timestamp}, best_strategy={self.best_strategy}, boats_placed={self.boats_placed})"
+
+
+class StrategyResult(Base):
+    """
+    Modell för strategiresultat.
+    Sparar detaljerade resultat för varje strategi i en optimering.
+    """
+    __tablename__ = "strategy_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    optimization_run_id = Column(Integer, ForeignKey(
+        "optimization_runs.id"), nullable=False)
+
+    # Strategiinformation
+    strategy_name = Column(String, nullable=False, index=True)
+    strategy_description = Column(Text, nullable=True)
+
+    # Prestanda-mått
+    boats_placed = Column(Integer, nullable=False, default=0)
+    placement_rate = Column(Float, nullable=False, default=0.0)
+    width_utilization = Column(Float, nullable=False, default=0.0)
+    execution_time_seconds = Column(Float, nullable=False)
+
+    # Detaljerade mått (JSON för flexibilitet)
+    detailed_metrics = Column(JSON, nullable=True)
+
+    # Eventuella fel
+    error_message = Column(Text, nullable=True)
+
+    # Relationer
+    optimization_run = relationship(
+        "OptimizationRun", back_populates="strategy_results")
+
+    def __repr__(self):
+        return f"StrategyResult(id={self.id}, strategy={self.strategy_name}, boats_placed={self.boats_placed})"
+
+
+class AIAnalysis(Base):
+    """
+    Modell för AI-analyser.
+    Sparar resultat från GPT-analyser för framtida referens och lärande.
+    """
+    __tablename__ = "ai_analyses"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Grundläggande metadata
+    timestamp = Column(DateTime, nullable=False,
+                       default=datetime.utcnow, index=True)
+    analysis_type = Column(String, nullable=False,
+                           index=True)  # AnalysisType enum
+
+    # AI-modell som användes
+    model_used = Column(String, nullable=False)
+    temperature = Column(Float, nullable=True)
+
+    # Input-data (hashar för att undvika duplicering)
+    input_hash = Column(String, nullable=True, index=True)
+    input_summary = Column(JSON, nullable=True)  # Sammanfattning av input-data
+
+    # AI-analys resultat
+    analysis_result = Column(JSON, nullable=False)  # Fullständig AI-analys
+    confidence_level = Column(String, nullable=True)  # ConfidenceLevel enum
+    confidence_score = Column(Float, nullable=True)  # 0.0-1.0
+
+    # Rekommendationer och insikter
+    recommendations = Column(JSON, nullable=True)
+    key_insights = Column(JSON, nullable=True)
+
+    # Chain of Thought reasoning (om aktiverat)
+    reasoning_steps = Column(JSON, nullable=True)
+
+    # Performance-mått
+    processing_time_seconds = Column(Float, nullable=True)
+    tokens_used = Column(Integer, nullable=True)
+
+    # Kvalitetsbedömning (kan fyllas i senare)
+    human_feedback_rating = Column(Integer, nullable=True)  # 1-5 skala
+    human_feedback_comments = Column(Text, nullable=True)
+
+    # Relationer
+    optimization_runs = relationship(
+        "OptimizationRun", back_populates="ai_analysis")
+
+    def __repr__(self):
+        return f"AIAnalysis(id={self.id}, type={self.analysis_type}, timestamp={self.timestamp}, confidence={self.confidence_level})"
+
+
+class AIQuestion(Base):
+    """
+    Modell för AI-frågor.
+    Sparar frågor som ställts till AI:n och deras svar.
+    """
+    __tablename__ = "ai_questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Fråga och svar
+    question = Column(Text, nullable=False)
+    answer = Column(Text, nullable=False)
+
+    # Metadata
+    timestamp = Column(DateTime, nullable=False,
+                       default=datetime.utcnow, index=True)
+    model_used = Column(String, nullable=False)
+
+    # Kontext som användes för att besvara frågan
+    context_summary = Column(JSON, nullable=True)
+
+    # Prestanda
+    processing_time_seconds = Column(Float, nullable=True)
+    tokens_used = Column(Integer, nullable=True)
+
+    # Kvalitetsbedömning
+    user_rating = Column(Integer, nullable=True)  # 1-5 skala
+    user_feedback = Column(Text, nullable=True)
+
+    def __repr__(self):
+        return f"AIQuestion(id={self.id}, question='{self.question[:50]}...', timestamp={self.timestamp})"
+
+
+class SystemMetrics(Base):
+    """
+    Modell för systemmått.
+    Sparar prestanda- och användningsstatistik.
+    """
+    __tablename__ = "system_metrics"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Tidsstämpel
+    timestamp = Column(DateTime, nullable=False,
+                       default=datetime.utcnow, index=True)
+    metric_date = Column(DateTime, nullable=False,
+                         index=True)  # Datum för måttet
+
+    # API-användning
+    api_requests_total = Column(Integer, nullable=False, default=0)
+    api_requests_ai = Column(Integer, nullable=False, default=0)
+    api_requests_optimization = Column(Integer, nullable=False, default=0)
+
+    # Optimeringsstatistik
+    optimizations_run = Column(Integer, nullable=False, default=0)
+    average_boats_placed = Column(Float, nullable=True)
+    average_execution_time = Column(Float, nullable=True)
+
+    # AI-användning
+    ai_analyses_run = Column(Integer, nullable=False, default=0)
+    ai_questions_asked = Column(Integer, nullable=False, default=0)
+    ai_tokens_used = Column(Integer, nullable=False, default=0)
+    ai_cost_estimate = Column(Float, nullable=True)  # Uppskattad kostnad i USD
+
+    # Systemresurser
+    memory_usage_mb = Column(Float, nullable=True)
+    cpu_usage_percent = Column(Float, nullable=True)
+
+    # Databas-mått
+    database_connections_active = Column(Integer, nullable=True)
+    database_query_time_avg = Column(Float, nullable=True)
+
+    def __repr__(self):
+        return f"SystemMetrics(date={self.metric_date}, api_requests={self.api_requests_total}, optimizations={self.optimizations_run})"
+
+
+class UserPreferences(Base):
+    """
+    Modell för användarpreferenser.
+    Sparar användarspecifika inställningar och preferenser.
+    """
+    __tablename__ = "user_preferences"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Användaridentifiering (kan utökas senare med riktig autentisering)
+    user_identifier = Column(String, nullable=False, unique=True, index=True)
+
+    # Preferenser för strategier
+    # Lista med föredragda strategier
+    preferred_strategies = Column(JSON, nullable=True)
+    strategy_weights = Column(JSON, nullable=True)  # Anpassade viktningar
+
+    # AI-preferenser
+    ai_detail_level = Column(String, nullable=False,
+                             default="medium")  # low, medium, high
+    ai_confidence_threshold = Column(Float, nullable=False, default=0.6)
+
+    # UI-preferenser
+    default_view = Column(String, nullable=True)
+    theme = Column(String, nullable=False, default="light")
+
+    # Notifieringsinställningar
+    email_notifications = Column(Boolean, nullable=False, default=False)
+    notification_frequency = Column(String, nullable=False, default="weekly")
+
+    # Metadata
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False,
+                        default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"UserPreferences(user={self.user_identifier}, ai_detail={self.ai_detail_level})"
+
+
+# Indexer för bättre prestanda
+Index('idx_boat_stays_boat_time', BoatStay.boat_id, BoatStay.start_time)
+Index('idx_boat_stays_slot_time', BoatStay.slot_id, BoatStay.start_time)
+Index('idx_boats_arrival', Boat.arrival)
+Index('idx_slots_type_status', Slot.slot_type, Slot.status)
+Index('idx_ai_analyses_type_timestamp',
+      AIAnalysis.analysis_type, AIAnalysis.timestamp)
+Index('idx_optimization_runs_timestamp', OptimizationRun.timestamp)
+Index('idx_strategy_results_strategy', StrategyResult.strategy_name)
+Index('idx_system_metrics_date', SystemMetrics.metric_date)
