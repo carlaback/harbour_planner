@@ -1,22 +1,46 @@
-# gpt_analyzer.py - omarbetad version
+# gpt_analyzer.py - Enhanced version med Chain of Thought och Learning
 from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import logging
 import asyncio
+from pathlib import Path
+from dataclasses import dataclass, asdict
 from openai import OpenAI, AsyncOpenAI
 from openai.types.chat import ChatCompletionMessage
-from models import Boat, Slot
+from models import Boat, Slot, BoatStay
 from config import settings
 
 # Konfigurera loggning
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class AnalysisMemory:
+    """Strukturerad data för att spara analys-minnen"""
+    timestamp: str
+    problem_context: Dict[str, Any]
+    reasoning_chain: List[Dict[str, Any]]
+    final_recommendation: str
+    confidence_level: float
+    actual_outcome: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class LearnedPattern:
+    """Mönster som AI:n har lärt sig från tidigare analyser"""
+    pattern_id: str
+    description: str
+    confidence: float
+    examples_count: int
+    last_validated: str
+    success_rate: float
+
+
 class GPTAnalyzer:
     """
     Analyserar strategier och ger rekommendationer med hjälp av GPT.
-    Förbättrad version med asynkron hantering, bättre felhantering och mer nyanserade analyser.
+    Enhanced version med Chain of Thought reasoning och learning från tidigare analyser.
     """
 
     def __init__(self, settings_obj=None):
@@ -46,15 +70,56 @@ class GPTAnalyzer:
             logger.warning(
                 "No OpenAI API key configured, GPT analysis unavailable")
 
-    async def analyze_strategies(self, evaluation_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # Learning system
+        self.memory_file = Path("analysis_memory.json")
+        self.patterns_file = Path("learned_patterns.json")
+        self.analysis_history = self._load_analysis_history()
+        self.learned_patterns = self._load_learned_patterns()
+
+    def _load_analysis_history(self) -> List[AnalysisMemory]:
+        """Ladda tidigare analyser från fil"""
+        try:
+            if self.memory_file.exists():
+                with open(self.memory_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return [AnalysisMemory(**item) for item in data]
+        except Exception as e:
+            logger.warning(f"Could not load analysis history: {e}")
+        return []
+
+    def _save_analysis_history(self):
+        """Spara analyshistorik till fil"""
+        try:
+            with open(self.memory_file, 'w', encoding='utf-8') as f:
+                json.dump([asdict(memory) for memory in self.analysis_history],
+                          f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Could not save analysis history: {e}")
+
+    def _load_learned_patterns(self) -> List[LearnedPattern]:
+        """Ladda inlärda mönster från fil"""
+        try:
+            if self.patterns_file.exists():
+                with open(self.patterns_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return [LearnedPattern(**item) for item in data]
+        except Exception as e:
+            logger.warning(f"Could not load learned patterns: {e}")
+        return []
+
+    def _save_learned_patterns(self):
+        """Spara inlärda mönster till fil"""
+        try:
+            with open(self.patterns_file, 'w', encoding='utf-8') as f:
+                json.dump([asdict(pattern) for pattern in self.learned_patterns],
+                          f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Could not save learned patterns: {e}")
+
+    async def analyze_strategies_with_learning(self, evaluation_results: List[Dict[str, Any]],
+                                               boats: List[Any] = None, slots: List[Any] = None) -> Dict[str, Any]:
         """
-        Analysera resultaten från olika strategier och ge rekommendationer.
-
-        Args:
-            evaluation_results: Lista med utvärderingsresultat för olika strategier
-
-        Returns:
-            Analys och rekommendationer från GPT
+        Enhanced analys med Chain of Thought och learning från tidigare analyser.
         """
         if not self.api_key or not self.async_client:
             logger.error(
@@ -62,36 +127,593 @@ class GPTAnalyzer:
             return self._create_error_response("OpenAI API key not configured")
 
         try:
-            # Skapa en detaljerad sammanfattning av resultaten
-            summary = self._create_summary(evaluation_results)
+            analysis_start = datetime.now()
+            logger.info("Starting Chain of Thought analysis with learning")
 
-            # Skapa en mer nyanserad prompt för GPT
-            prompt = self._create_enhanced_prompt(summary)
+            # Steg 1: Förbered kontext med historisk kunskap
+            context = self._prepare_enhanced_context(
+                evaluation_results, boats, slots)
 
-            # Anropa GPT-API asynkront
-            response = await self._async_call_gpt(prompt)
+            # Steg 2: Kör Chain of Thought reasoning
+            reasoning_chain = await self._execute_chain_of_thought_reasoning(context)
 
-            # Extrahera och formatera svaret
-            if not response:
-                return self._create_error_response("Failed to get response from GPT API")
+            # Steg 3: Generera slutsatser med historisk kontext
+            final_analysis = await self._synthesize_conclusions_with_learning(reasoning_chain, context)
 
-            analysis = response.content
+            # Steg 4: Spara för framtida lärande
+            memory_entry = AnalysisMemory(
+                timestamp=analysis_start.isoformat(),
+                problem_context=context["current_problem"],
+                reasoning_chain=reasoning_chain,
+                final_recommendation=final_analysis.get(
+                    "primary_recommendation", ""),
+                confidence_level=final_analysis.get("confidence", 0.5)
+            )
 
-            # Strukturera och tolka analysen för att förse bättre insikter
-            structured_analysis = self._structure_analysis(analysis)
+            self._add_to_memory(memory_entry)
+
+            # Steg 5: Uppdatera inlärda mönster
+            learning_update = self._update_learned_patterns(
+                reasoning_chain, final_analysis)
+
+            execution_time = (datetime.now() - analysis_start).total_seconds()
 
             return {
-                "analysis": analysis,
-                "summary": summary,
-                "structured_analysis": structured_analysis,
-                "recommendation": self._extract_recommendation(analysis),
-                "top_strategy": self._extract_top_strategy(analysis, summary),
-                "improvement_suggestions": self._extract_improvement_suggestions(analysis)
+                "analysis_type": "Chain of Thought with Historical Learning",
+                "timestamp": analysis_start.isoformat(),
+                "execution_time_seconds": execution_time,
+                "context_summary": {
+                    "current_strategies": len(evaluation_results),
+                    "historical_cases_used": len(context.get("similar_cases", [])),
+                    "learned_patterns_applied": len(context.get("applicable_patterns", []))
+                },
+                "reasoning_chain": reasoning_chain,
+                "final_analysis": final_analysis,
+                "learning_update": learning_update,
+                "confidence_assessment": self._assess_analysis_confidence(reasoning_chain, context)
             }
 
         except Exception as e:
-            logger.exception(f"Error during GPT analysis: {str(e)}")
-            return self._create_error_response(f"Error during GPT analysis: {str(e)}")
+            logger.exception(f"Error during enhanced GPT analysis: {str(e)}")
+            return self._create_error_response(f"Error during enhanced GPT analysis: {str(e)}")
+
+    def _prepare_enhanced_context(self, evaluation_results: List[Dict[str, Any]],
+                                  boats: List[Any], slots: List[Any]) -> Dict[str, Any]:
+        """Förbered kontext med både aktuell data och historisk kunskap"""
+
+        # Grundläggande problemkontext
+        summary = self._create_summary(evaluation_results)
+
+        current_problem = {
+            "total_strategies": summary["total_strategies"],
+            "best_placement_rate": summary.get("best_strategy", {}).get("metrics", {}).get("placement_rate", 0),
+            "average_performance": summary["average_placement_rate"],
+            "problem_size": {
+                "boats": len(boats) if boats else 0,
+                "slots": len(slots) if slots else 0
+            },
+            "complexity_indicators": self._assess_problem_complexity(boats, slots)
+        }
+
+        # Hitta liknande historiska fall
+        similar_cases = self._find_similar_cases(current_problem)
+
+        # Identifiera tillämpliga mönster
+        applicable_patterns = self._get_applicable_patterns(current_problem)
+
+        return {
+            "current_problem": current_problem,
+            "evaluation_results": evaluation_results,
+            "summary": summary,
+            "similar_cases": similar_cases[:3],  # Top 3 liknande fall
+            "applicable_patterns": applicable_patterns,
+            "boats_stats": self._analyze_boats_stats(boats) if boats else {},
+            "slots_stats": self._analyze_slots_stats(slots) if slots else {}
+        }
+
+    async def _execute_chain_of_thought_reasoning(self, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Utför strukturerad Chain of Thought reasoning"""
+
+        reasoning_steps = []
+
+        # Steg 1: Problemförståelse
+        step1 = await self._reasoning_step_problem_understanding(context)
+        reasoning_steps.append(step1)
+
+        # Steg 2: Historisk kontextanalys
+        step2 = await self._reasoning_step_historical_analysis(context, step1)
+        reasoning_steps.append(step2)
+
+        # Steg 3: Mönsterigenkänning
+        step3 = await self._reasoning_step_pattern_recognition(context, reasoning_steps)
+        reasoning_steps.append(step3)
+
+        # Steg 4: Hypotesformulering
+        step4 = await self._reasoning_step_hypothesis_formation(context, reasoning_steps)
+        reasoning_steps.append(step4)
+
+        # Steg 5: Evidensanalys
+        step5 = await self._reasoning_step_evidence_analysis(context, reasoning_steps)
+        reasoning_steps.append(step5)
+
+        return reasoning_steps
+
+    async def _reasoning_step_problem_understanding(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Steg 1: Grundläggande problemförståelse med Chain of Thought"""
+
+        current = context["current_problem"]
+        summary = context["summary"]
+
+        prompt = f"""
+        Som expert inom hamnplanering, analysera detta optimeringsproblem steg för steg:
+
+        AKTUELLT PROBLEM:
+        - Antal strategier testade: {current['total_strategies']}
+        - Bästa placeringsgrad: {current['best_placement_rate']:.1%}
+        - Genomsnittsprestanda: {current['average_performance']:.1%}
+        - Problemstorlek: {current['problem_size']['boats']} båtar, {current['problem_size']['slots']} platser
+
+        STRATEGIRESULTAT:
+        {self._format_strategies_for_reasoning(context['evaluation_results'])}
+
+        TANKEGÅNG STEG 1 - PROBLEMFÖRSTÅELSE:
+        1. Vad är min första bedömning av denna optimeringsutmaning?
+        2. Vilka är de mest uppenbara styrkorna och svagheterna i resultaten?
+        3. Vad indikerar placeringsgraden om problemets svårighetsgrad?
+        4. Finns det tydliga mönster i hur olika strategier presterar?
+
+        Svara med din steg-för-steg tankegång som JSON:
+        {{
+            "step": "problem_understanding",
+            "initial_assessment": "din första bedömning",
+            "key_observations": ["observation1", "observation2", ...],
+            "performance_patterns": "vad du ser i prestanda",
+            "problem_difficulty": "enkel/medel/svår och varför"
+        }}
+        """
+
+        response = await self._call_gpt_for_reasoning(prompt)
+        return response
+
+    async def _reasoning_step_historical_analysis(self, context: Dict[str, Any], step1: Dict[str, Any]) -> Dict[str, Any]:
+        """Steg 2: Analysera historisk kontext och tidigare liknande fall"""
+
+        similar_cases = context.get("similar_cases", [])
+
+        historical_context = ""
+        if similar_cases:
+            historical_context = f"""
+        HISTORISKA LIKNANDE FALL:
+        {self._format_historical_cases(similar_cases)}
+        """
+        else:
+            historical_context = "HISTORISK KONTEXT: Inga tidigare liknande fall tillgängliga."
+
+        prompt = f"""
+        Fortsätt din analys med historisk kontext:
+
+        TIDIGARE TANKEGÅNG:
+        {json.dumps(step1, indent=2)}
+
+        {historical_context}
+
+        TANKEGÅNG STEG 2 - HISTORISK ANALYS:
+        1. Hur stämmer nuvarande resultat överens med tidigare erfarenheter?
+        2. Vilka lärdomar från historiken är tillämpliga här?
+        3. Ser jag några avvikelser från förväntade mönster?
+        4. Vad kan historiska fall berätta om framgångsrika strategier för detta problemområde?
+
+        Svara med din tankegång som JSON:
+        {{
+            "step": "historical_analysis",
+            "historical_comparison": "jämförelse med tidigare fall",
+            "applicable_lessons": ["lärdom1", "lärdom2", ...],
+            "pattern_deviations": "avvikelser från förväntade mönster",
+            "historical_insights": "vad historiken lär oss"
+        }}
+        """
+
+        response = await self._call_gpt_for_reasoning(prompt)
+        return response
+
+    async def _reasoning_step_pattern_recognition(self, context: Dict[str, Any], previous_steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Steg 3: Identifiera mönster baserat på inlärda patterns"""
+
+        applicable_patterns = context.get("applicable_patterns", [])
+
+        patterns_context = ""
+        if applicable_patterns:
+            patterns_context = f"""
+        INLÄRDA MÖNSTER SOM KAN VARA RELEVANTA:
+        {self._format_learned_patterns(applicable_patterns)}
+        """
+        else:
+            patterns_context = "MÖNSTERIGENKÄNNING: Inga tidigare inlärda mönster tillgängliga för detta problem."
+
+        prompt = f"""
+        Fortsätt analysen med mönsterigenkänning:
+
+        TIDIGARE TANKEGÅNGAR:
+        {json.dumps(previous_steps, indent=2)}
+
+        {patterns_context}
+
+        TANKEGÅNG STEG 3 - MÖNSTERIGENKÄNNING:
+        1. Vilka mönster kan jag identifiera i de aktuella strategiresultaten?
+        2. Matchar dessa mönster något av de tidigare inlärda mönstren?
+        3. Finns det nya mönster som framträder i denna analys?
+        4. Hur kan erkända mönster hjälpa mig förstå varför vissa strategier fungerar bättre?
+
+        Svara med din tankegång som JSON:
+        {{
+            "step": "pattern_recognition",
+            "identified_patterns": ["mönster1", "mönster2", ...],
+            "pattern_matching": "hur nya mönster matchar tidigare",
+            "new_patterns": ["nytt_mönster1", "nytt_mönster2", ...],
+            "pattern_explanations": "varför dessa mönster uppstår"
+        }}
+        """
+
+        response = await self._call_gpt_for_reasoning(prompt)
+        return response
+
+    async def _reasoning_step_hypothesis_formation(self, context: Dict[str, Any], previous_steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Steg 4: Formulera hypoteser baserat på analysis hittills"""
+
+        prompt = f"""
+        Baserat på din analys hittills, formulera hypoteser:
+
+        SAMMANFATTNING AV TIDIGARE STEG:
+        {json.dumps(previous_steps, indent=2)}
+
+        TANKEGÅNG STEG 4 - HYPOTESFORMULERING:
+        1. Vilka hypoteser kan jag formulera om varför vissa strategier fungerar bättre?
+        2. Vad är mina teorier om de underliggande orsakerna till prestationsskillnaderna?
+        3. Vilka specifika faktorer tror jag påverkar framgången mest?
+        4. Hur kan jag testa eller validera dessa hypoteser?
+
+        Svara med din tankegång som JSON:
+        {{
+            "step": "hypothesis_formation",
+            "main_hypotheses": [
+                {{"hypothesis": "hypotes1", "reasoning": "varför", "confidence": 0.8}},
+                {{"hypothesis": "hypotes2", "reasoning": "varför", "confidence": 0.6}}
+            ],
+            "underlying_factors": ["faktor1", "faktor2", ...],
+            "testable_predictions": ["prediction1", "prediction2", ...],
+            "validation_methods": "hur testa hypoteserna"
+        }}
+        """
+
+        response = await self._call_gpt_for_reasoning(prompt)
+        return response
+
+    async def _reasoning_step_evidence_analysis(self, context: Dict[str, Any], previous_steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Steg 5: Analysera evidens för hypoteserna"""
+
+        prompt = f"""
+        Analysera evidensen för dina hypoteser:
+
+        ALLA TIDIGARE TANKEGÅNGAR:
+        {json.dumps(previous_steps, indent=2)}
+
+        DETALJERADE STRATEGIRESULTAT:
+        {json.dumps(context['evaluation_results'], indent=2)}
+
+        TANKEGÅNG STEG 5 - EVIDENSANALYS:
+        1. Vilken evidens stödjer mina huvudhypoteser?
+        2. Vilken evidens motsäger eller försvagar mina hypoteser?
+        3. Hur stark är evidensen för varje hypotes på en skala 1-10?
+        4. Vilka slutsatser kan jag dra med hög säkerhet, och vilka är mer osäkra?
+
+        Svara med din slutgiltiga tankegång som JSON:
+        {{
+            "step": "evidence_analysis",
+            "supporting_evidence": [
+                {{"hypothesis": "hypotes", "evidence": "evidens", "strength": 8}}
+            ],
+            "contradicting_evidence": [
+                {{"hypothesis": "hypotes", "evidence": "motbevis", "impact": "låg/medel/hög"}}
+            ],
+            "confidence_ratings": {{"hypotes1": 0.9, "hypotes2": 0.6}},
+            "high_confidence_conclusions": ["slutsats1", "slutsats2"],
+            "uncertain_areas": ["osäkerhet1", "osäkerhet2"]
+        }}
+        """
+
+        response = await self._call_gpt_for_reasoning(prompt)
+        return response
+
+    async def _synthesize_conclusions_with_learning(self, reasoning_chain: List[Dict[str, Any]], context: Dict[str, Any]) -> Dict[str, Any]:
+        """Syntetisera slutsatser från Chain of Thought med historisk kunskap"""
+
+        prompt = f"""
+        Baserat på din fullständiga Chain of Thought-analys, ge en sammanfattande slutsats:
+
+        FULLSTÄNDIG TANKEGÅNG:
+        {json.dumps(reasoning_chain, indent=2)}
+
+        KONTEXTSAMMANFATTNING:
+        - Strategier testade: {context['current_problem']['total_strategies']}
+        - Bästa resultat: {context['current_problem']['best_placement_rate']:.1%}
+        - Historiska fall använda: {len(context.get('similar_cases', []))}
+
+        SLUTGILTIG SYNTES:
+        1. Vad är min huvudsakliga rekommendation baserat på hela analysen?
+        2. Vilken strategi rekommenderar jag och varför?
+        3. Vilka specifika förbättringar skulle jag föreslå?
+        4. Vad är min förtroendenivå för denna analys?
+        5. Vilka nya insikter har jag lärt mig som kan vara värdefulla framöver?
+
+        Svara med en strukturerad slutsats som JSON:
+        {{
+            "primary_recommendation": "huvudrekommendation",
+            "recommended_strategy": {{
+                "name": "strateginamn",
+                "reason": "varför denna strategi",
+                "expected_improvement": "förväntad förbättring"
+            }},
+            "specific_improvements": ["förbättring1", "förbättring2", ...],
+            "confidence": 0.85,
+            "key_insights": ["insikt1", "insikt2", ...],
+            "learning_for_future": ["lärdom1", "lärdom2", ...],
+            "risk_factors": ["risk1", "risk2", ...],
+            "next_steps": ["steg1", "steg2", ...]
+        }}
+        """
+
+        response = await self._call_gpt_for_reasoning(prompt)
+        return response
+
+    async def _call_gpt_for_reasoning(self, prompt: str) -> Dict[str, Any]:
+        """Anropa GPT för reasoning med error handling"""
+        try:
+            response = await self.async_client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "Du är en expert på hamnoptimering som tänker steg för steg och alltid svarar med välformatterad JSON. Visa ditt resonemang tydligt."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,  # Lägre temperatur för mer konsekvent reasoning
+                max_tokens=self.max_tokens
+            )
+
+            content = response.choices[0].message.content
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                # Om JSON-parsing misslyckas, returnera raw content
+                return {"raw_response": content, "parsing_error": True}
+
+        except Exception as e:
+            logger.error(f"Error in GPT reasoning call: {e}")
+            return {"error": str(e), "step": "unknown"}
+
+    def _find_similar_cases(self, current_problem: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Hitta liknande historiska fall"""
+        similar_cases = []
+
+        for memory in self.analysis_history:
+            # Beräkna likhet baserat på problemstorlek och prestanda
+            similarity_score = 0.0
+
+            past_problem = memory.problem_context
+
+            # Jämför problemstorlek
+            if past_problem.get("problem_size"):
+                size_diff = abs(past_problem["problem_size"].get(
+                    "boats", 0) - current_problem["problem_size"]["boats"])
+                size_similarity = max(0, 1 - size_diff / 100)  # Normalisera
+                similarity_score += size_similarity * 0.4
+
+            # Jämför prestanda
+            if past_problem.get("best_placement_rate"):
+                performance_diff = abs(
+                    past_problem["best_placement_rate"] - current_problem["best_placement_rate"])
+                perf_similarity = max(0, 1 - performance_diff)
+                similarity_score += perf_similarity * 0.6
+
+            if similarity_score > 0.5:  # Threshold för likhet
+                similar_cases.append({
+                    "timestamp": memory.timestamp,
+                    "similarity_score": similarity_score,
+                    "context": past_problem,
+                    "recommendation": memory.final_recommendation,
+                    "confidence": memory.confidence_level
+                })
+
+        # Sortera efter likhet
+        similar_cases.sort(key=lambda x: x["similarity_score"], reverse=True)
+        return similar_cases[:3]
+
+    def _get_applicable_patterns(self, current_problem: Dict[str, Any]) -> List[LearnedPattern]:
+        """Hämta tillämpliga inlärda mönster"""
+        applicable = []
+
+        for pattern in self.learned_patterns:
+            # Enkel matching baserat på problemstorlek och typ
+            if pattern.confidence > 0.6 and pattern.success_rate > 0.7:
+                applicable.append(pattern)
+
+        return applicable[:5]  # Top 5 mönster
+
+    def _add_to_memory(self, memory: AnalysisMemory):
+        """Lägg till ny analys i minnet"""
+        self.analysis_history.append(memory)
+
+        # Begränsa historikstorlek
+        if len(self.analysis_history) > 50:
+            self.analysis_history = self.analysis_history[-50:]
+
+        self._save_analysis_history()
+
+    def _update_learned_patterns(self, reasoning_chain: List[Dict[str, Any]], final_analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Uppdatera inlärda mönster baserat på ny analys"""
+        new_patterns = []
+        updated_patterns = []
+
+        # Extrahera nya mönster från reasoning chain
+        for step in reasoning_chain:
+            if step.get("step") == "pattern_recognition":
+                new_patterns_found = step.get("new_patterns", [])
+                for pattern_desc in new_patterns_found:
+                    # Skapa nytt mönster
+                    pattern_id = f"pattern_{len(self.learned_patterns)}_{datetime.now().strftime('%Y%m%d')}"
+                    new_pattern = LearnedPattern(
+                        pattern_id=pattern_id,
+                        description=pattern_desc,
+                        confidence=0.6,  # Initial confidence
+                        examples_count=1,
+                        last_validated=datetime.now().isoformat(),
+                        success_rate=0.7  # Initial success rate
+                    )
+                    self.learned_patterns.append(new_pattern)
+                    new_patterns.append(pattern_desc)
+
+        # Uppdatera befintliga mönster om de användes
+        for pattern in self.learned_patterns:
+            pattern.last_validated = datetime.now().isoformat()
+            pattern.examples_count += 1
+            updated_patterns.append(pattern.pattern_id)
+
+        self._save_learned_patterns()
+
+        return {
+            "new_patterns_learned": new_patterns,
+            "patterns_reinforced": len(updated_patterns),
+            "total_patterns": len(self.learned_patterns)
+        }
+
+    def _assess_analysis_confidence(self, reasoning_chain: List[Dict[str, Any]], context: Dict[str, Any]) -> Dict[str, Any]:
+        """Bedöm förtroendet för analysen"""
+        confidence_factors = []
+
+        # Faktorer som påverkar förtroende
+        if len(context.get("similar_cases", [])) > 0:
+            confidence_factors.append(
+                {"factor": "historical_cases", "contribution": 0.2})
+
+        if len(context.get("applicable_patterns", [])) > 0:
+            confidence_factors.append(
+                {"factor": "learned_patterns", "contribution": 0.3})
+
+        if context["current_problem"]["total_strategies"] >= 5:
+            confidence_factors.append(
+                {"factor": "sufficient_strategies", "contribution": 0.2})
+
+        # Beräkna total confidence
+        total_confidence = min(1.0, sum(
+            f["contribution"] for f in confidence_factors) + 0.3)  # Base confidence
+
+        return {
+            "overall_confidence": total_confidence,
+            "confidence_factors": confidence_factors,
+            "confidence_level": "Hög" if total_confidence > 0.8 else "Medium" if total_confidence > 0.6 else "Låg"
+        }
+
+    # Hjälpmetoder för formattering
+    def _format_strategies_for_reasoning(self, evaluation_results: List[Dict[str, Any]]) -> str:
+        """Formatera strategiresultat för reasoning prompts"""
+        formatted = []
+        for result in evaluation_results:
+            name = result.get("strategy_name", "Unknown")
+            metrics = result.get("metrics", {})
+            placement_rate = metrics.get("placement_rate", 0)
+            boats_placed = metrics.get("boats_placed", 0)
+
+            formatted.append(
+                f"- {name}: {placement_rate:.1%} placeringsgrad ({boats_placed} båtar)")
+
+        return "\n".join(formatted)
+
+    def _format_historical_cases(self, similar_cases: List[Dict[str, Any]]) -> str:
+        """Formatera historiska fall för prompts"""
+        formatted = []
+        for i, case in enumerate(similar_cases):
+            formatted.append(f"""
+        Fall {i+1} (Likhet: {case['similarity_score']:.1%}):
+        - Datum: {case['timestamp']}
+        - Rekommendation: {case['recommendation']}
+        - Förtroende: {case['confidence']:.1%}
+            """)
+        return "\n".join(formatted)
+
+    def _format_learned_patterns(self, patterns: List[LearnedPattern]) -> str:
+        """Formatera inlärda mönster för prompts"""
+        formatted = []
+        for pattern in patterns:
+            formatted.append(f"""
+        - {pattern.description}
+          (Förtroende: {pattern.confidence:.1%}, Framgång: {pattern.success_rate:.1%}, Exempel: {pattern.examples_count})
+            """)
+        return "\n".join(formatted)
+
+    def _assess_problem_complexity(self, boats: List[Any], slots: List[Any]) -> Dict[str, Any]:
+        """Bedöm problemkomplexitet"""
+        if not boats or not slots:
+            return {"level": "unknown", "factors": []}
+
+        complexity_factors = []
+
+        # Kapacitetsratio
+        capacity_ratio = len(boats) / len(slots) if slots else 0
+        if capacity_ratio > 0.9:
+            complexity_factors.append("hög_kapacitetsanvändning")
+
+        # Breddvariation
+        boat_widths = [b.width for b in boats if hasattr(b, 'width')]
+        if boat_widths:
+            width_variance = max(boat_widths) - min(boat_widths)
+            if width_variance > 2.0:
+                complexity_factors.append("stor_breddvariation")
+
+        complexity_level = "hög" if len(complexity_factors) > 2 else "medel" if len(
+            complexity_factors) > 0 else "låg"
+
+        return {
+            "level": complexity_level,
+            "factors": complexity_factors,
+            "capacity_ratio": capacity_ratio
+        }
+
+    def _analyze_boats_stats(self, boats: List[Any]) -> Dict[str, Any]:
+        """Analysera båtstatistik"""
+        if not boats:
+            return {}
+
+        widths = [b.width for b in boats if hasattr(b, 'width')]
+
+        return {
+            "count": len(boats),
+            "width_stats": {
+                "min": min(widths) if widths else 0,
+                "max": max(widths) if widths else 0,
+                "avg": sum(widths) / len(widths) if widths else 0
+            }
+        }
+
+    def _analyze_slots_stats(self, slots: List[Any]) -> Dict[str, Any]:
+        """Analysera platsstatistik"""
+        if not slots:
+            return {}
+
+        max_widths = [s.max_width for s in slots if hasattr(s, 'max_width')]
+
+        return {
+            "count": len(slots),
+            "max_width_stats": {
+                "min": min(max_widths) if max_widths else 0,
+                "max": max(max_widths) if max_widths else 0,
+                "avg": sum(max_widths) / len(max_widths) if max_widths else 0
+            }
+        }
+
+    # Behåll befintliga metoder för bakåtkompatibilitet
+    async def analyze_strategies(self, evaluation_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Standard analysmetod - nu med förbättrad Chain of Thought som standard
+        """
+        return await self.analyze_strategies_with_learning(evaluation_results)
 
     def _create_summary(self, evaluation_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -475,7 +1097,7 @@ Svara i tydliga punkter som kan användas av hamnoperatörerna. Avsluta med en s
             "timestamp": datetime.now().isoformat()
         }
 
-    # Behåll den gamla metoden för bakåtkompatibilitet, men märk som föråldrad
+    # Gamla metoder för bakåtkompatibilitet
     def analyze_strategies_old(self, strategy_evaluations: Dict[str, Dict[str, Any]],
                                boats: List[Boat], slots: List[Slot]) -> Dict[str, Any]:
         """
@@ -506,7 +1128,6 @@ Svara i tydliga punkter som kan användas av hamnoperatörerna. Avsluta med en s
         except Exception as e:
             return self._create_error_response(f"Error in analyze_strategies_old: {str(e)}")
 
-    # Behåll hjälpmetoder för bakåtkompatibilitet
     def _summarize_boats(self, boats: List[Boat]) -> Dict[str, Any]:
         """Sammanfattar båtdata"""
         return {

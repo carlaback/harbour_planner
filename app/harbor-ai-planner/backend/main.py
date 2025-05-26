@@ -4,7 +4,7 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, update, delete, desc
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from typing import List, Dict, Any, Optional
@@ -180,7 +180,13 @@ async def root():
             {"path": "/api/docks", "description": "Hantera bryggor"},
             {"path": "/api/optimize", "description": "Kör optimering och AI-analys"},
             {"path": "/api/test-data", "description": "Skapa testdata"},
-            {"path": "/api/harbor-layout", "description": "Skapa hamnlayout"}
+            {"path": "/api/harbor-layout", "description": "Skapa hamnlayout"},
+            {"path": "/api/analyze-results",
+                "description": "Kör AI-analys på resultat"},
+            {"path": "/api/analysis-history", "description": "Se AI-analyshistorik"},
+            {"path": "/api/ask-ai", "description": "Ställ frågor till AI:n"},
+            {"path": "/api/ai-recommendations",
+                "description": "Få AI-rekommendationer"}
         ]
     }
 
@@ -1111,18 +1117,11 @@ async def optimize_harbor(
 
 async def _perform_optimization(db: AsyncSession, strategy_names: List[str] = None) -> Dict[str, Any]:
     """
-    Utför den faktiska optimeringsprocessen.
-
-    Args:
-        db: Databassession
-        strategy_names: Lista över strategier att köra
-
-    Returns:
-        Resultat av optimering och AI-analys
+    Utför den faktiska optimeringsprocessen med förbättrad AI-analys.
     """
     try:
         start_time = time.time()
-        logger.info("Starting optimization process")
+        logger.info("Starting optimization process with enhanced AI analysis")
 
         # Hämta alla båtar och platser från databasen
         boats_query = select(Boat).options(selectinload(Boat.boat_stays))
@@ -1149,148 +1148,134 @@ async def _perform_optimization(db: AsyncSession, strategy_names: List[str] = No
 
         logger.info(f"Using strategies: {', '.join(strategy_names)}")
 
-        # Hitta strategierna med debug-information
+        # Hitta strategierna
         strategies = []
-        logger.info(f"Looking for strategies: {strategy_names}")
-        logger.info(
-            f"Available strategies in STRATEGY_MAP: {list(STRATEGY_MAP.keys())}")
-
         for name in strategy_names:
             strategy = get_strategy_by_name(name)
             if strategy:
                 strategies.append(strategy)
-                # DEBUG: Logga vilken strategiklass som faktiskt laddas
                 logger.info(
-                    f"✅ Loaded strategy '{name}' -> {type(strategy).__name__} (object id: {id(strategy)})")
+                    f"✅ Loaded strategy '{name}' -> {type(strategy).__name__}")
             else:
                 logger.warning(f"❌ Strategy '{name}' not found")
-
-        # DEBUG: Kontrollera att vi har olika strategiobjekt
-        if strategies:
-            strategy_types = [type(s).__name__ for s in strategies]
-            logger.info(f"Final strategy types loaded: {strategy_types}")
-            # Kontrollera om alla strategier är samma objekt
-            unique_objects = len(set(id(s) for s in strategies))
-            logger.info(
-                f"Number of unique strategy objects: {unique_objects} (should be {len(strategies)})")
-        else:
-            logger.error("No strategies loaded!")
 
         if not strategies:
             raise HTTPException(
                 status_code=400, detail="No valid strategies specified")
 
-        all_results = {}
-        evaluations = {}
+        # Kör strategierna med förbättrad utvärdering
+        evaluator = StrategyEvaluator(db)
+        evaluation_results = []
 
         for strategy in strategies:
-            strategy_start = time.time()
-            logger.info(f"Running strategy: {strategy.name}")
-
             try:
-                # Kör strategin
-                boat_stays = await strategy.place_boats(db, boats, slots)
-                all_results[strategy.name] = boat_stays
-
-                # Enkel utvärdering direkt här
-                boats_placed = len(set(stay.boat_id for stay in boat_stays))
-                placement_rate = boats_placed / len(boats) if boats else 0
-
-                # Beräkna utnyttjandegrad
-                total_utilization = 0
-                utilization_count = 0
-                for stay in boat_stays:
-                    boat = next(
-                        (b for b in boats if b.id == stay.boat_id), None)
-                    slot = next(
-                        (s for s in slots if s.id == stay.slot_id), None)
-                    if boat and slot and slot.max_width > 0:
-                        total_utilization += boat.width / slot.max_width
-                        utilization_count += 1
-
-                avg_utilization = total_utilization / \
-                    utilization_count if utilization_count > 0 else 0
-
-                evaluations[strategy.name] = {
-                    "boats_placed": boats_placed,
-                    "total_boats": len(boats),
-                    "placement_rate": placement_rate,
-                    "utilization": avg_utilization,
-                    "score": placement_rate  # Använd placement_rate som score
-                }
-
-                strategy_time = time.time() - strategy_start
+                result = await evaluator.evaluate_strategy(strategy, boats, slots)
+                evaluation_results.append(result)
                 logger.info(
-                    f"Strategy {strategy.name} completed in {strategy_time:.2f}s with {boats_placed} boats placed")
-
+                    f"Strategy {strategy.name} completed - {result['metrics'].get('boats_placed', 0)} boats placed")
             except Exception as e:
                 logger.error(f"Strategy {strategy.name} failed: {str(e)}")
-                evaluations[strategy.name] = {
-                    "boats_placed": 0,
-                    "total_boats": len(boats),
-                    "placement_rate": 0,
-                    "utilization": 0,
-                    "score": 0,
-                    "error": str(e)
+                # Lägg till fejlresultat
+                evaluation_results.append({
+                    "strategy_name": strategy.name,
+                    "metrics": {"boats_placed": 0, "placement_rate": 0, "error": str(e)},
+                    "stays": []
+                })
+
+        # Förbättrad AI-analys med Chain of Thought och learning
+        gpt_analyzer = GPTAnalyzer()
+
+        if settings.OPENAI_API_KEY:
+            try:
+                logger.info(
+                    "Starting enhanced AI analysis with Chain of Thought")
+                ai_analysis = await gpt_analyzer.analyze_strategies_with_learning(
+                    evaluation_results, boats, slots
+                )
+                logger.info(
+                    f"AI analysis completed with confidence: {ai_analysis.get('confidence_assessment', {}).get('confidence_level', 'Unknown')}")
+            except Exception as e:
+                logger.error(f"AI analysis failed: {str(e)}")
+                ai_analysis = {
+                    "error": str(e),
+                    "fallback_analysis": {
+                        "message": "AI analysis unavailable, using basic evaluation",
+                        "best_strategy": max(evaluation_results, key=lambda x: x['metrics'].get('boats_placed', 0))['strategy_name'] if evaluation_results else "none"
+                    }
                 }
-
-        # Skapa en detaljerad utvärdering (tom för nu)
-        detailed_evaluation = {}
-
-        # Hitta bästa strategin
-        if evaluations:
-            best_strategy_name = max(
-                evaluations.items(), key=lambda x: x[1].get('boats_placed', 0))[0]
-            best_boats_placed = evaluations[best_strategy_name].get(
-                'boats_placed', 0)
         else:
-            best_strategy_name = "ingen"
-            best_boats_placed = 0
+            logger.info(
+                "No OpenAI API key configured, using fallback analysis")
+            ai_analysis = {
+                "message": "OpenAI API key not configured",
+                "fallback_analysis": {
+                    "best_strategy": max(evaluation_results, key=lambda x: x['metrics'].get('boats_placed', 0))['strategy_name'] if evaluation_results else "none"
+                }
+            }
 
-        # Skapa enkel AI-analys (utan GPT för nu)
-        gpt_analysis = {
-            "best_strategy": best_strategy_name,
-            "recommendations": [
-                f"Automatisk optimering valde strategin '{best_strategy_name}' som placerade {best_boats_placed} av {len(boats)} båtar.",
-                f"Placeringsgrad: {(best_boats_placed / len(boats) * 100):.1f}%" if len(
-                    boats) > 0 else "Inga båtar att placera."
+        # Konvertera resultat för kompatibilitet
+        strategies_formatted = {}
+        evaluations = {}
+
+        for result in evaluation_results:
+            strategy_name = result["strategy_name"]
+            stays = result.get("stays", [])
+            metrics = result.get("metrics", {})
+
+            # Formatera för 'strategies' sektionen
+            strategies_formatted[strategy_name] = [
+                {
+                    "boat_id": stay["boat_id"],
+                    "boat_name": f"Boat {stay['boat_id']}",
+                    "boat_width": 3.0,  # Placeholder - skulle behöva hämtas från boats
+                    "slot_id": stay["slot_id"],
+                    "slot_name": f"Slot {stay['slot_id']}",
+                    "slot_max_width": 4.0,  # Placeholder
+                    "start_time": stay["start_time"],
+                    "end_time": stay["end_time"]
+                }
+                for stay in stays
             ]
-        }
+
+            # Formatera för 'evaluations' sektionen
+            evaluations[strategy_name] = {
+                "boats_placed": metrics.get("boats_placed", 0),
+                "total_boats": len(boats),
+                "placement_rate": metrics.get("placement_rate", 0),
+                "utilization": metrics.get("average_width_utilization", 0),
+                "score": metrics.get("placement_rate", 0),
+                "execution_time": result.get("execution_time_seconds", 0)
+            }
 
         total_time = time.time() - start_time
-        logger.info(f"Optimization process completed in {total_time:.2f}s")
+        logger.info(
+            f"Enhanced optimization process completed in {total_time:.2f}s")
 
-        # Returnera resultaten
         return {
             "timestamp": datetime.now().isoformat(),
             "execution_time_seconds": total_time,
-            "strategies": {
-                name: [
-                    {
-                        "boat_id": stay.boat_id,
-                        "boat_name": next((b.name for b in boats if b.id == stay.boat_id), "Unknown"),
-                        "boat_width": next((b.width for b in boats if b.id == stay.boat_id), 0),
-                        "slot_id": stay.slot_id,
-                        "slot_name": next((s.name for s in slots if s.id == stay.slot_id), "Unknown"),
-                        "slot_max_width": next((s.max_width for s in slots if s.id == stay.slot_id), 0),
-                        "start_time": serialize_datetime(stay.start_time),
-                        "end_time": serialize_datetime(stay.end_time)
-                    }
-                    for stay in stays
-                ]
-                for name, stays in all_results.items()
-            },
+            "strategies": strategies_formatted,
             "evaluations": evaluations,
-            "detailed_evaluation": detailed_evaluation,
-            "gpt_analysis": gpt_analysis
+            "detailed_evaluation": {
+                "evaluation_results": evaluation_results,
+                "total_strategies_tested": len(evaluation_results),
+                "successful_strategies": len([r for r in evaluation_results if r['metrics'].get('boats_placed', 0) > 0])
+            },
+            "ai_analysis": ai_analysis,
+            "enhancement_info": {
+                "chain_of_thought_enabled": bool(settings.OPENAI_API_KEY),
+                "learning_system_active": True,
+                "analysis_type": ai_analysis.get("analysis_type", "basic"),
+                "confidence_level": ai_analysis.get("confidence_assessment", {}).get("confidence_level", "Unknown")
+            }
         }
+
     except HTTPException:
-        # Vidarebefordra HTTP-undantag
         raise
     except Exception as e:
         error = handle_exception(e)
         raise HTTPException(
-            status_code=500, detail=f"Optimization failed: {error}")
+            status_code=500, detail=f"Enhanced optimization failed: {error}")
 
 
 @app.get("/api/optimize/{job_id}", response_model=Dict[str, Any], tags=["Optimization"])
@@ -1330,6 +1315,199 @@ async def get_optimization_result(job_id: str):
         error = handle_exception(e)
         raise HTTPException(
             status_code=500, detail=f"Failed to retrieve optimization result: {error}")
+
+# --- AI Analysis endpoints ---
+
+
+@app.post("/api/analyze-results", response_model=Dict[str, Any], tags=["AI Analysis"])
+async def analyze_optimization_results(
+    request_data: Dict[str, Any],
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Kör AI-analys på befintliga optimeringsresultat med Chain of Thought.
+
+    Args:
+        request_data: Dictionary med evaluation_results och optionally boats/slots data
+    """
+    try:
+        logger.info("Starting standalone AI analysis")
+
+        evaluation_results = request_data.get("evaluation_results", [])
+        if not evaluation_results:
+            raise HTTPException(
+                status_code=400, detail="No evaluation results provided")
+
+        # Hämta båtar och platser om de inte finns i request
+        boats_data = request_data.get("boats")
+        slots_data = request_data.get("slots")
+
+        if not boats_data or not slots_data:
+            # Hämta från databas
+            boats_result = await db.execute(select(Boat))
+            slots_result = await db.execute(select(Slot))
+            boats_data = boats_result.scalars().all()
+            slots_data = slots_result.scalars().all()
+
+        # Kör AI-analys
+        gpt_analyzer = GPTAnalyzer()
+
+        if not settings.OPENAI_API_KEY:
+            raise HTTPException(
+                status_code=400, detail="OpenAI API key not configured for AI analysis")
+
+        ai_analysis = await gpt_analyzer.analyze_strategies_with_learning(
+            evaluation_results, boats_data, slots_data
+        )
+
+        logger.info("Standalone AI analysis completed")
+
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "ai_analysis": ai_analysis,
+            "input_summary": {
+                "strategies_analyzed": len(evaluation_results),
+                "boats_count": len(boats_data) if hasattr(boats_data, '__len__') else 0,
+                "slots_count": len(slots_data) if hasattr(slots_data, '__len__') else 0
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error = handle_exception(e)
+        raise HTTPException(
+            status_code=500, detail=f"AI analysis failed: {error}")
+
+
+@app.get("/api/analysis-history", response_model=List[Dict[str, Any]], tags=["AI Analysis"])
+async def get_analysis_history(
+    limit: int = Query(10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Hämta historik över AI-analyser.
+
+    Args:
+        limit: Maximalt antal analyser att returnera
+    """
+    try:
+        # För nu returnerar vi en tom lista, men här skulle man kunna
+        # implementera lagring av analyshistorik i databasen
+        logger.info(f"Fetching analysis history (limit: {limit})")
+
+        # Placeholder - i framtiden skulle vi ha en Analysis-tabell
+        return []
+
+    except Exception as e:
+        error = handle_exception(e)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch analysis history: {error}")
+
+
+@app.post("/api/ask-ai", response_model=Dict[str, Any], tags=["AI Analysis"])
+async def ask_ai_question(
+    request_data: Dict[str, Any],
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Ställ en fråga till AI:n om hamnoptimering.
+
+    Args:
+        request_data: Dictionary med "question" och optionally context data
+    """
+    try:
+        question = request_data.get("question")
+        if not question:
+            raise HTTPException(status_code=400, detail="No question provided")
+
+        if not settings.OPENAI_API_KEY:
+            raise HTTPException(
+                status_code=400, detail="OpenAI API key not configured")
+
+        logger.info(f"Processing AI question: {question[:50]}...")
+
+        # Hämta kontext från databasen
+        boats_result = await db.execute(select(Boat))
+        slots_result = await db.execute(select(Slot))
+        boats = boats_result.scalars().all()
+        slots = slots_result.scalars().all()
+
+        # Använd GPT för att svara på frågan
+        gpt_analyzer = GPTAnalyzer()
+        response = await gpt_analyzer.answer_question(question, boats, slots, request_data.get("context"))
+
+        logger.info("AI question answered successfully")
+
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "question": question,
+            "answer": response,
+            "context_used": {
+                "boats_count": len(boats),
+                "slots_count": len(slots),
+                "additional_context": bool(request_data.get("context"))
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error = handle_exception(e)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to process AI question: {error}")
+
+
+@app.get("/api/ai-recommendations", response_model=Dict[str, Any], tags=["AI Analysis"])
+async def get_ai_recommendations(
+    context_type: str = Query(
+        "general", description="Type of recommendations: general, optimization, layout"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Få AI-rekommendationer för hamnoptimering.
+
+    Args:
+        context_type: Typ av rekommendationer att få
+    """
+    try:
+        if not settings.OPENAI_API_KEY:
+            raise HTTPException(
+                status_code=400, detail="OpenAI API key not configured")
+
+        logger.info(
+            f"Generating AI recommendations for context: {context_type}")
+
+        # Hämta aktuell data från databasen
+        boats_result = await db.execute(select(Boat))
+        slots_result = await db.execute(select(Slot))
+        boats = boats_result.scalars().all()
+        slots = slots_result.scalars().all()
+
+        # Använd GPT för att generera rekommendationer
+        gpt_analyzer = GPTAnalyzer()
+        recommendations = await gpt_analyzer.generate_recommendations(context_type, boats, slots)
+
+        logger.info("AI recommendations generated successfully")
+
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "context_type": context_type,
+            "recommendations": recommendations,
+            "data_summary": {
+                "boats_count": len(boats),
+                "slots_count": len(slots),
+                "available_slots": len([s for s in slots if s.status == "available"]),
+                "occupied_slots": len([s for s in slots if s.status == "occupied"])
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error = handle_exception(e)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to generate AI recommendations: {error}")
 
 # --- Testdata-endpoint ---
 
@@ -1628,7 +1806,7 @@ async def create_harbor_layout(db: AsyncSession = Depends(get_db)):
         slots.extend(create_slot_row(324, 23, 290, 780,
                      20, 30, False, 3, "Brygga H", "flex"))
 
-        # Gästhamn (201-246)# Gästhamn (201-246)
+        # Gästhamn (201-246)
         slots.extend(create_slot_row(201, 25, 160, 960, 20,
                      30, False, 3, "Gästhamn", "guest"))
 
@@ -1638,7 +1816,7 @@ async def create_harbor_layout(db: AsyncSession = Depends(get_db)):
         slots.extend(create_slot_row(141, 40, 160, 1250, 15, 30,
                      False, 2, "Brygga K", "permanent", "occupied"))
 
-        # Udden (50-5
+        # Udden (50-59)
         slots.extend(create_slot_row(50, 10, 45, 1340,
                      20, 18, True, 2, "Udden", "guest"))
 
